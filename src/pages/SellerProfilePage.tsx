@@ -1,6 +1,7 @@
 import { useMutation } from "@tanstack/react-query";
 import { useEffect, useState, type FormEvent } from "react";
 import { usersApi } from "@/api/endpoints";
+import { tokenStore } from "@/api/client";
 import type { User, UserUpdateRequest } from "@/api/types";
 import { useAuth } from "@/auth/AuthContext";
 import { GstinInput } from "@/components/GstinInput";
@@ -163,7 +164,13 @@ function PasswordCard() {
   const [confirm, setConfirm] = useState("");
   const change = useMutation({
     mutationFn: () => usersApi.changePassword({ current_password: current, new_password: next }),
-    onSuccess: () => {
+    onSuccess: (tokens) => {
+      // The change signs out every session issued before it, this one included.
+      // Keeping the access token the server hands back leaves the current
+      // device signed in; without it the next request would 401 and bounce the
+      // user to login. The matching refresh cookie was replaced in the same
+      // response.
+      tokenStore.set(tokens.access_token);
       setCurrent("");
       setNext("");
       setConfirm("");
@@ -182,7 +189,11 @@ function PasswordCard() {
         }}
       >
         <ErrorBanner error={change.error} onDismiss={() => change.reset()} />
-        {change.isSuccess && <InfoBanner tone="success">Password changed. Use the new one next time you sign in.</InfoBanner>}
+        {change.isSuccess && (
+          <InfoBanner tone="success">
+            Password changed. Every other device has been signed out; use the new password there.
+          </InfoBanner>
+        )}
         <div className="grid three">
           <Field label="Current password" required>
             <Input type="password" autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} required />

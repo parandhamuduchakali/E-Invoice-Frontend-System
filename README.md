@@ -12,7 +12,9 @@ scanned-invoice intake through the backend's OCR pipeline.
 | UI | React 19, plain CSS (`src/styles.css`) |
 | Routing | React Router 7 |
 | Server state | TanStack Query 5 |
-| API client | `fetch` wrapper (`src/api/client.ts`): JWT bearer, `{error, detail}` → `ApiError` |
+| API client | `fetch` wrapper (`src/api/client.ts`): in-memory bearer token, `{error, detail}` → `ApiError` |
+| Resilience | `ErrorBoundary` around the router — a render error shows a panel, not a blank page |
+| Bundle | Routes are `React.lazy` code-split; CI fails if the entry bundle passes its budget |
 | Tests | Vitest + Testing Library; live API integration test (opt-in) |
 
 ---
@@ -73,6 +75,34 @@ VITE_API_BASE_URL=https://api.example.com npm run build
 `src/lib/invoiceMath.ts` duplicates the backend's rounding so the live totals match what gets saved.
 Change both together when the API changes.
 
+The rounding has to agree to the paisa. The backend computes in `Decimal` with `ROUND_HALF_UP`, which is
+what `round2` here does with its `Number.EPSILON` nudge — Python's built-in `round()` is banker's rounding
+and would disagree on exactly the values (`2.675`) a user is most likely to notice.
+
+---
+
+## Session tokens
+
+The access token is held in a module variable in `src/api/client.ts` and is **never** written to
+`localStorage`. The refresh token is not held by this app at all: the backend sets it as an `HttpOnly`
+cookie scoped to `/api/v1/auth`, so neither this code nor any script injected into the page can read it.
+
+That split is the point. An XSS bug that can read a seven-day refresh token is an account takeover; the
+same bug against a thirty-minute access token buys a window that dies with the tab. The cost is that a page
+reload starts with no token, so `AuthProvider` calls `refreshSession()` once on boot to trade the cookie
+for a fresh access token before loading `/auth/me` — which is why the first paint shows a spinner even for
+a signed-in user.
+
+Two consequences worth knowing:
+
+* every request sets `credentials: "include"`, because login, refresh and logout need the cookie (the path
+  scope means nothing is actually attached to the other routes);
+* signing out calls `POST /auth/logout` so the cookie is cleared server-side. Without it the cookie would
+  outlive the session and the next reload would silently sign the user back in.
+
+The only thing this app persists is `einvoice.workspace`, the workspace id an admin has switched to — a
+preference, not a credential.
+
 ---
 
 ## Scripts
@@ -95,6 +125,15 @@ E2E_BASE_URL=http://127.0.0.1:5173 VITE_API_BASE_URL=http://127.0.0.1:5173 npx v
 ```
 
 ---
+### Scanning an invoice
+
+A scanned document in, a reviewable draft out:
+
+| Uploaded scan | What the backend extracted |
+|---|---|
+| ![A scanned GST tax invoice](docs/ocr-input.png) | ![The Scan page showing extracted GST fields and the rebuilt item table](docs/ocr-output.png) |
+
+---
 
 ## Roles
 
@@ -106,8 +145,8 @@ guards whole routes, and the sidebar only lists pages the role can open.
 | Role | What they see in the UI |
 |---|---|
 | admin | Everything a manager has, plus a **workspace switcher** in the sidebar: pick another owner and every page shows and edits *their* data (the API client sends `X-Workspace-Id`); a banner shows whose workspace is open |
-| manager | Everything in their own workspace, plus **Users & roles** (`/users`) to add engineers, client users and managers |
-| engineer | Dashboard, invoices, clients, OCR. No delete buttons, no IRN form, no seller-profile fields |
+| manager | Everything in their own workspace, plus **Users & roles** (`/users`) to add engineers, client users and managers, and the **Audit trail** (`/audit`) |
+| engineer | Dashboard, invoices, clients, OCR. No delete buttons, no IRN form, no seller-profile fields, no audit trail |
 | client | Dashboard and invoices for their own client only; the Clients page shows just their record; no OCR, no create/edit |
 
 Self-registration creates a manager (the very first account becomes admin; the backend can turn self-registration
@@ -120,17 +159,55 @@ split on the invoice form matches what the backend computes.
 
 | Route | What it does | Backend endpoints |
 |---|---|---|
-| `/login`, `/register`, `/forgot-password`, `/reset-password` | JWT auth; access + refresh tokens in `localStorage`. A 401 triggers one silent `POST /auth/refresh` and retries the call; if that fails the session is cleared | `POST /auth/login`, `POST /auth/register`, `POST /auth/refresh`, `POST /auth/forgot-password`, `POST /auth/reset-password`, `GET /auth/me` |
+| `/login`, `/register`, `/forgot-password`, `/reset-password` | JWT auth. The access token lives in memory only; the refresh token is an `HttpOnly` cookie the browser keeps and no script can read — see [Session tokens](#session-tokens). A 401 triggers one silent `POST /auth/refresh` and retries the call; if that fails the session is cleared | `POST /auth/login`, `POST /auth/register`, `POST /auth/refresh`, `POST /auth/logout`, `POST /auth/forgot-password`, `POST /auth/reset-password`, `GET /auth/me` |
 | `/` Dashboard | Stat cards, then a master-detail view: invoice cards on the left (status filter, **New +**), a printable invoice preview on the right (seller block, client, total / paid / balance due, items, totals) with **Print** and **Open** | `GET /invoices/stats`, `GET /invoices/`, `GET /invoices/:id` |
 | `/profile` | Seller profile (`SellerDtls`) with live GSTIN check-digit validation and a "still needed for IRP" list | `PATCH /users/me`, `GET /gst/validate-gstin`, `GET /gst/state-codes` |
 | `/clients` | Buyers with GSTIN / state / place of supply; create, edit, delete | `/clients` CRUD |
 | `/invoices` | Paginated list, status filter, number search, IRN badge | `GET /invoices/` |
 | `/invoices/new`, `/invoices/:id/edit` | Full GST form: document type, supply type, reverse charge, IGST-on-intra, place of supply, preceding document for notes, ship-to / dispatch-from, line items with HSN/SAC, unit, discount and rate; **live totals with the tax split** | `POST /invoices/`, `PATCH /invoices/:id` |
 | `/invoices/:id` | Detail, status change (dropdown offers only the backend's `allowed_status_transitions`), link to the scanned source document, delete; **e-invoice panel**: readiness checklist with fix links, INV-01 JSON (copy / download), record IRN + ack + signed QR; locked after IRN | `/einvoice/readiness`, `/einvoice`, `/irn` |
-| `/ocr` | Drag-and-drop PDF / image, OpenCV options, recognised lines with confidence, extracted GST fields, **Create invoice from this** (pre-fills the form incl. `document_id` and `source_reference`, pre-selects a client by GSTIN); shows the stored document id and whether the file was a duplicate | `GET /ocr/status`, `POST /ocr/extract` |
+| `/ocr` | Drag-and-drop PDF / image, OpenCV options, extracted GST fields, and the **item table rebuilt from the page layout** (description, HSN, qty, rate, GST %, amount) with a warning on any row whose arithmetic does not reconcile. **Create invoice from this** pre-fills the form from those rows, incl. `document_id` and `source_reference`, and pre-selects a client by GSTIN. The upload returns immediately and the page polls the document until it is `processed` or `failed` — see [Long-running OCR](#long-running-ocr) | `GET /ocr/status`, `POST /documents/`, `GET /documents/:id` |
 | `/documents` | Every stored upload with status (processed / failed), engine, pages and the invoice it produced; open the file, re-run OCR, create an invoice from a processed scan, delete (blocked while linked) | `/documents` CRUD, `POST /documents/:id/retry`, `GET /documents/:id/file` |
+| `/audit` | Append-only audit trail (managers and admins): who changed what and when, filterable by action, record type and date, each row expandable to the before/after values, plus a CSV export of the current filter. Admins can widen the scope to every workspace | `GET /audit/`, `GET /audit/actions`, `GET /audit/export.csv` |
 
 ---
+
+## Long-running OCR
+
+Recognising a page takes tens of seconds, and a 20-page PDF takes minutes. The frontend never waits that
+out on an open connection:
+
+```
+POST /documents/          -> 202 { id, status: "pending" }     (returns in ~250ms)
+GET  /documents/{id}      -> status: "pending"  … poll every 2s
+GET  /documents/{id}      -> status: "processed" | "failed"
+```
+
+`OcrPage` does this with a TanStack Query whose `refetchInterval` stops as soon as the status leaves
+`pending`, so polling ends by itself. A `failed` document shows the reason and points at
+`/documents`, where it can be retried against the stored file — the upload is never lost.
+
+`ocrApi.extract` still exists and does the whole parse in one synchronous call. It is kept for scripts
+and the live integration test; the UI does not use it.
+
+### Reading the extracted table
+
+The backend rebuilds the invoice's item table from the OCR box layout and returns one row per line item,
+each with the OCR confidence behind it and a list of `warnings`. A row is flagged rather than hidden when
+it cannot be true — `quantity x rate` not reaching the printed amount, a GST rate that is not a real slab,
+a unit column holding a number. `ocrToInvoiceDraft` still uses those rows to pre-fill the invoice form,
+because a row the user can see and correct beats an empty draft with no explanation.
+
+When the engine returns no box positions — a PDF text layer, or the LlamaParse backend — there is no
+layout to rebuild, `line_items` comes back empty, and the draft falls back to spreading the document
+total across the HSN codes it found.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request: `npm ci`, type-check, tests, build, and a
+**bundle budget**. The budget is the point of the code splitting — without a check, lazy routes quietly
+get pulled back into the entry chunk by a stray top-level import, and nobody notices until first paint is
+slow again. The build fails if the entry bundle passes its ceiling.
 
 ## Look and feel
 
@@ -146,17 +223,18 @@ either page produces a clean invoice printout / PDF. Icons are inline SVGs in `s
 ```
 src/
 ├── api/
-│   ├── client.ts        fetch wrapper: base URL, bearer token, ApiError, auth:expired event
-│   ├── endpoints.ts     authApi, usersApi, clientsApi, invoicesApi, gstApi, ocrApi
+│   ├── client.ts        fetch wrapper: base URL, in-memory access token, ApiError, auth:expired event
+│   ├── endpoints.ts     authApi, usersApi, clientsApi, invoicesApi, gstApi, documentsApi, ocrApi, auditApi
 │   └── types.ts         TS mirrors of the backend schemas
-├── auth/AuthContext.tsx JWT session + current user
+├── auth/AuthContext.tsx session restore from the refresh cookie + current user
 ├── lib/
 │   ├── gst.ts           GSTIN mod-36 check digit, pincode/HSN formats, rate & UQC options
 │   ├── invoiceMath.ts   live totals preview (mirrors backend rounding)
 │   ├── ocrToInvoice.ts  OCR fields → invoice draft
 │   └── format.ts        INR money, DD/MM/YYYY dates, IRN shortening
-├── components/          Layout, ProtectedRoute, ui primitives, StateCodeSelect, GstinInput
-├── pages/               one file per route
+├── components/          Layout, ProtectedRoute, ErrorBoundary, ui primitives, StateCodeSelect, GstinInput
+├── App.tsx              routes; every page below the auth screens is lazy-loaded
+├── pages/               one file per route (each becomes its own bundle chunk)
 └── test/                unit tests + e2e.api.test.ts (opt-in live test)
 scripts/dev-all.ps1|sh   start backend + frontend together
 ```
@@ -169,6 +247,11 @@ bodies the API client flattens into a readable sentence.
 
 - **OneDrive**: `node_modules/` inside a synced folder is slow and can develop cloud-placeholder files.
   Clone outside OneDrive for day-to-day development if you can.
-- OCR runs on the backend at roughly a minute per page on CPU; the page shows a progress state.
+- OCR runs on the backend at roughly a minute per page on CPU. The upload returns straight away and the
+  page polls for the result, so nothing depends on a browser or proxy holding a request open that long.
 - If port 5173 is busy, run `npx vite --port 5180` (the proxy still targets the backend).
-- Opening a stored document uses `fetch` with the auth header and an object URL, because a plain `<a href>` cannot carry the Bearer token.
+- Opening a stored document uses `fetch` with the auth header and an object URL, because a plain `<a href>`
+  cannot carry the Bearer token. The object URL is built with the document's own content type only when it is
+  one the backend accepts (PDF or image); anything else is handed over as `application/octet-stream`. A `blob:`
+  URL inherits *this* origin, where the session token lives, so the type it opens with decides whether the tab
+  renders a document or executes a payload.

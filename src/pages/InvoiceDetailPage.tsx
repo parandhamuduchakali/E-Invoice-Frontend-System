@@ -3,7 +3,7 @@ import { useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { ApiError } from "@/api/client";
 import { clientsApi, invoicesApi } from "@/api/endpoints";
-import type { InvoiceStatus, IrnRecordRequest } from "@/api/types";
+import type { InvoiceStatus, IrnCancelRequest, IrnRecordRequest } from "@/api/types";
 import { useAuth } from "@/auth/AuthContext";
 import { InvoicePreview } from "@/components/InvoicePreview";
 import { DownloadIcon, PrintIcon } from "@/components/icons";
@@ -38,6 +38,14 @@ export function InvoiceDetailPage() {
 
   const [irnForm, setIrnForm] = useState<IrnRecordRequest>({ irn: "", ack_no: "", ack_date: "", signed_qr_code: "" });
   const recordIrn = useMutation({ mutationFn: (body: IrnRecordRequest) => invoicesApi.recordIrn(invoiceId, body), onSuccess: () => { invalidate(); setPayload(null); } });
+
+  // Which portal this deployment files with. Rarely changes, so it is cached
+  // for the session rather than re-fetched per invoice.
+  const irp = useQuery({ queryKey: ["irp", "status"], queryFn: invoicesApi.irpStatus, enabled: canEinvoice, staleTime: Infinity });
+  const submit = useMutation({ mutationFn: () => invoicesApi.submitEinvoice(invoiceId), onSuccess: () => { invalidate(); setPayload(null); } });
+
+  const [cancelForm, setCancelForm] = useState<IrnCancelRequest>({ reason_code: "2", remarks: "" });
+  const cancelIrn = useMutation({ mutationFn: (body: IrnCancelRequest) => invoicesApi.cancelIrn(invoiceId, body), onSuccess: invalidate });
 
   if (invoice.isPending) return <Spinner />;
   if (invoice.error) return <ErrorBanner error={invoice.error} />;
@@ -87,10 +95,27 @@ export function InvoiceDetailPage() {
         />
         <ErrorBanner error={setStatus.error ?? remove.error} onDismiss={() => { setStatus.reset(); remove.reset(); }} />
 
-        {inv.irn && (
-          <InfoBanner tone="success">
+        {inv.irn && !inv.irn_cancelled_at && (
+          <InfoBanner tone={inv.irp_backend === "mock" ? "warn" : "success"}>
             <div>
-              <strong>Registered with the IRP.</strong> IRN <code className="qr">{inv.irn}</code> · Ack {inv.ack_no} on {inv.ack_date}. Financial fields are locked; only status, notes and terms can change.
+              <strong>{inv.irp_backend === "mock" ? "Registered with the simulated IRP." : "Registered with the IRP."}</strong>{" "}
+              IRN <code className="qr">{inv.irn}</code> · Ack {inv.ack_no} on {inv.ack_date}. Financial fields are locked;
+              only status, notes and terms can change.
+              {inv.irp_backend === "mock" && (
+                <div className="muted small">
+                  This deployment runs the in-process simulator: the IRN is the one the portal would assign, but
+                  nothing was filed with the government and the QR code is not signed. Do not print it on a real invoice.
+                </div>
+              )}
+            </div>
+          </InfoBanner>
+        )}
+        {inv.irn_cancelled_at && (
+          <InfoBanner tone="warn">
+            <div>
+              <strong>IRN cancelled</strong> on {displayDateTime(inv.irn_cancelled_at)}
+              {inv.irn_cancel_remarks ? ` — ${inv.irn_cancel_remarks}` : ""}. Issue a fresh document under a new
+              number if this supply still needs an invoice.
             </div>
           </InfoBanner>
         )}
@@ -185,11 +210,45 @@ export function InvoiceDetailPage() {
           )}
 
           {!canIrn && (
-            <InfoBanner tone="info">Recording the IRN is reserved for managers and admins. Hand the generated JSON and the IRP response to your workspace manager.</InfoBanner>
+            <InfoBanner tone="info">Filing with the IRP is reserved for managers and admins. Hand the generated JSON to your workspace manager.</InfoBanner>
           )}
+
           {canIrn && (
-            <form onSubmit={submitIrn} style={{ marginTop: "1.25rem" }}>
-              <h3>Record IRP response</h3>
+            <div style={{ marginTop: "1.25rem" }}>
+              <h3>File with the IRP</h3>
+              <p className="muted small" style={{ marginTop: 0 }}>
+                Sends this invoice to the Invoice Registration Portal and stores the IRN, acknowledgement and
+                signed QR it returns.
+                {irp.data && !irp.data.live && " This deployment runs the simulator — nothing reaches the government."}
+                {irp.data?.live && ` Filing as ${irp.data.gstin}.`}
+              </p>
+              <ErrorBanner error={submit.error} onDismiss={() => submit.reset()} />
+              {submit.data?.duplicate && (
+                <InfoBanner tone="info">
+                  The portal already held this document, so its existing registration was adopted rather than a
+                  second one created.
+                </InfoBanner>
+              )}
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => submit.mutate()}
+                disabled={submit.isPending || readiness.data?.ready === false}
+                title={readiness.data?.ready === false ? "Fix the readiness checklist first" : "Submit to the IRP"}
+              >
+                {submit.isPending ? "Submitting…" : irp.data && !irp.data.live ? "Submit (simulated)" : "Submit to the IRP"}
+              </button>
+            </div>
+          )}
+
+          {canIrn && (
+            <details style={{ marginTop: "1.25rem" }}>
+              <summary>Record an IRN obtained elsewhere</summary>
+              <p className="muted small">
+                For a document already registered through another tool or the portal's own web form. Filing from
+                here is the normal route.
+              </p>
+            <form onSubmit={submitIrn}>
               <ErrorBanner error={recordIrn.error} onDismiss={() => recordIrn.reset()} />
               <div className="grid two">
                 <Field label="IRN" required hint="64 hexadecimal characters." error={irnForm.irn && !/^[0-9a-fA-F]{64}$/.test(irnForm.irn.trim()) ? "Must be exactly 64 hex characters." : null}>
@@ -212,7 +271,45 @@ export function InvoiceDetailPage() {
                 <p className="muted small">That IRN is already recorded on another invoice.</p>
               )}
             </form>
+            </details>
           )}
+        </Card>
+      )}
+
+      {canIrn && inv.irn && !inv.irn_cancelled_at && (
+        <Card title="Cancel the IRN" className="no-print">
+          <p className="muted small" style={{ marginTop: 0 }}>
+            The portal accepts a cancellation for {irp.data?.cancel_window_hours ?? 24} hours after registration.
+            After that the correct instrument is a credit note against this invoice.
+          </p>
+          <ErrorBanner error={cancelIrn.error} onDismiss={() => cancelIrn.reset()} />
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              cancelIrn.mutate(cancelForm);
+            }}
+          >
+            <div className="grid two">
+              <Field label="Reason" required>
+                <Select
+                  value={cancelForm.reason_code}
+                  onChange={(e) => setCancelForm({ ...cancelForm, reason_code: e.target.value as IrnCancelRequest["reason_code"] })}
+                >
+                  {Object.entries(irp.data?.cancel_reasons ?? { "1": "Duplicate", "2": "Data entry mistake", "3": "Order cancelled", "4": "Others" }).map(
+                    ([code, label]) => (
+                      <option key={code} value={code}>{label}</option>
+                    ),
+                  )}
+                </Select>
+              </Field>
+              <Field label="Remarks" required hint="Stored with the cancellation at the portal; 3–100 characters.">
+                <Input value={cancelForm.remarks} onChange={(e) => setCancelForm({ ...cancelForm, remarks: e.target.value })} maxLength={100} />
+              </Field>
+            </div>
+            <button className="btn danger" type="submit" disabled={cancelIrn.isPending || cancelForm.remarks.trim().length < 3}>
+              {cancelIrn.isPending ? "Cancelling…" : "Cancel the IRN"}
+            </button>
+          </form>
         </Card>
       )}
 

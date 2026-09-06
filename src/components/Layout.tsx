@@ -10,7 +10,7 @@ import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { usersApi } from "@/api/endpoints";
 import { useAuth } from "@/auth/AuthContext";
 import { can, isWorkspaceOwner, ROLE_LABELS, type Permission } from "@/lib/permissions";
-import { AlertIcon, Avatar, ChevronDownIcon, FolderIcon, HomeIcon, LogoutIcon, ReceiptIcon, RupeeIcon, ScanIcon, ShieldIcon, UserIcon, UsersIcon } from "./icons";
+import { AlertIcon, Avatar, ChevronDownIcon, FolderIcon, HistoryIcon, HomeIcon, LogoutIcon, ReceiptIcon, RupeeIcon, ScanIcon, ShieldIcon, UserIcon, UsersIcon } from "./icons";
 import { Select } from "./ui";
 
 interface NavItem {
@@ -28,6 +28,7 @@ const NAV: NavItem[] = [
   { to: "/ocr", label: "Scan invoice", icon: ScanIcon, permission: "ocr:run" },
   { to: "/documents", label: "Documents", icon: FolderIcon, permission: "ocr:run" },
   { to: "/users", label: "Users & roles", icon: ShieldIcon, permission: "users:manage" },
+  { to: "/audit", label: "Audit trail", icon: HistoryIcon, permission: "audit:read" },
   { to: "/profile", label: "Profile", icon: UserIcon },
 ];
 

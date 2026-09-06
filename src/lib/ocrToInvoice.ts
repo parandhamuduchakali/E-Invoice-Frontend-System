@@ -6,6 +6,7 @@
 
 import type { ExtractedInvoiceFields, InvoiceCreateRequest, LineItemInput, User } from "@/api/types";
 import { addDaysIso, todayIso } from "./format";
+import { round2 } from "./invoiceMath";
 
 export interface OcrInvoiceDraft {
   invoice: Partial<InvoiceCreateRequest>;
@@ -54,24 +55,52 @@ export function ocrToInvoiceDraft(fields: ExtractedInvoiceFields, seller: User |
     notes.push(`GST rate ${invoice.tax_rate}% detected.`);
   }
 
-  // One line item per HSN code; amounts cannot be attributed per line from a
-  // flat text stream, so quantity 1 and the document total spread evenly.
-  const hsnCodes = fields.hsn_codes.length ? fields.hsn_codes : [null];
-  const perLine = fields.total_amount && hsnCodes.length ? fields.total_amount / hsnCodes.length : 0;
-  const rate = invoice.tax_rate ?? 0;
-  // Back out tax so the total after tax approximates the document total.
-  const perLineNet = rate ? perLine / (1 + rate / 100) : perLine;
-  invoice.line_items = hsnCodes.map<LineItemInput>((hsn, index) => ({
-    description: hsn ? `Item ${index + 1} (HSN ${hsn})` : `Item ${index + 1}`,
-    hsn_code: hsn,
-    is_service: hsn ? hsn.startsWith("99") : false,
-    quantity: 1,
-    unit_price: Math.round(perLineNet * 100) / 100,
-    discount: 0,
-    gst_rate: null,
-  }));
-  if (fields.total_amount) {
-    notes.push(`Document total ${fields.total_amount} spread across ${hsnCodes.length} line(s); adjust quantities and prices.`);
+  // Line items, best source first.
+  //
+  // When the OCR engine returned box positions, the backend rebuilds the item
+  // table's grid and reads each row's own quantity, rate and HSN — so the draft
+  // is the document's actual lines. Without positions (a PDF text layer, or
+  // LlamaParse) there is nothing to attribute amounts to, and the old estimate
+  // stands in: one line per HSN code with the total spread evenly.
+  if (fields.line_items.length) {
+    invoice.line_items = fields.line_items.map<LineItemInput>((row, index) => ({
+      description: row.description || `Item ${index + 1}`,
+      hsn_code: row.hsn_code,
+      is_service: row.hsn_code ? row.hsn_code.startsWith("99") : false,
+      unit: row.unit,
+      quantity: row.quantity ?? 1,
+      // Some invoices print only a row total; derive the rate from it.
+      unit_price: row.unit_price ?? (row.amount !== null && row.quantity ? row.amount / row.quantity : (row.amount ?? 0)),
+      discount: row.discount ?? 0,
+      gst_rate: row.gst_rate,
+    }));
+    notes.push(`${fields.line_items.length} line item(s) read from the document's item table. Check the quantities and rates.`);
+
+    const printed = fields.line_items.reduce((sum, row) => sum + (row.amount ?? 0), 0);
+    if (printed > 0 && fields.total_amount && Math.abs(printed - fields.total_amount) > 1) {
+      notes.push(
+        `Line amounts add up to ${round2(printed)} but the document total reads ${fields.total_amount}. ` +
+          "Taxes or a discount may not have been picked up — review before saving.",
+      );
+    }
+  } else {
+    const hsnCodes = fields.hsn_codes.length ? fields.hsn_codes : [null];
+    const perLine = fields.total_amount && hsnCodes.length ? fields.total_amount / hsnCodes.length : 0;
+    const rate = invoice.tax_rate ?? 0;
+    // Back out tax so the total after tax approximates the document total.
+    const perLineNet = rate ? perLine / (1 + rate / 100) : perLine;
+    invoice.line_items = hsnCodes.map<LineItemInput>((hsn, index) => ({
+      description: hsn ? `Item ${index + 1} (HSN ${hsn})` : `Item ${index + 1}`,
+      hsn_code: hsn,
+      is_service: hsn ? hsn.startsWith("99") : false,
+      quantity: 1,
+      unit_price: round2(perLineNet),
+      discount: 0,
+      gst_rate: null,
+    }));
+    if (fields.total_amount) {
+      notes.push(`No item table could be read, so the document total ${fields.total_amount} was spread across ${hsnCodes.length} line(s); adjust quantities and prices.`);
+    }
   }
 
   const sellerGstin = seller?.gstin?.toUpperCase() ?? null;

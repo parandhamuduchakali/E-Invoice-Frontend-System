@@ -2,6 +2,7 @@
 
 import { api } from "./client";
 import type {
+  AuditEvent,
   Client,
   ClientInput,
   DashboardStats,
@@ -13,11 +14,15 @@ import type {
   InvoiceCreateRequest,
   InvoiceStatus,
   InvoiceUpdateRequest,
+  IrnCancelRequest,
   IrnRecordRequest,
+  IrpStatus,
+  IrpSubmissionResult,
   PasswordChangeRequest,
   OcrDocument,
   OcrExtractOptions,
   OcrStatus,
+  PaginatedAuditEvents,
   PaginatedInvoices,
   StoredDocument,
   StoredDocumentSummary,
@@ -36,7 +41,14 @@ export const authApi = {
   login: (email: string, password: string) =>
     api.post<TokenResponse>(`${V1}/auth/login`, { email, password }),
   me: () => api.get<User>(`${V1}/auth/me`),
-  refresh: (refresh_token: string) => api.post<TokenResponse>(`${V1}/auth/refresh`, { refresh_token }),
+  /**
+   * Renews the session. Sends no body: the refresh token is in the HttpOnly
+   * cookie the browser attaches to `/api/v1/auth`. Prefer `refreshSession()`
+   * from the client module, which is single-flighted.
+   */
+  refresh: () => api.post<TokenResponse>(`${V1}/auth/refresh`),
+  /** Clears the refresh cookie server-side. Always succeeds. */
+  logout: () => api.post<void>(`${V1}/auth/logout`),
   /** Always resolves (202) — the server never reveals whether the email exists. */
   forgotPassword: (email: string) => api.post<void>(`${V1}/auth/forgot-password`, { email }),
   /** 400 when the token is unknown, used, or expired. */
@@ -51,7 +63,8 @@ export const usersApi = {
   roles: () => api.get<Record<string, string[]>>(`${V1}/users/roles`),
   /** Profile of the workspace owner — the seller whose GST details go on every invoice. */
   workspace: () => api.get<User>(`${V1}/users/workspace`),
-  changePassword: (body: PasswordChangeRequest) => api.post<void>(`${V1}/users/me/password`, body),
+  /** Revokes every other session; returns a fresh pair so this device stays signed in. */
+  changePassword: (body: PasswordChangeRequest) => api.post<TokenResponse>(`${V1}/users/me/password`, body),
 };
 
 export const clientsApi = {
@@ -82,6 +95,12 @@ export const invoicesApi = {
   readiness: (id: number) => api.get<EInvoiceReadiness>(`${V1}/invoices/${id}/einvoice/readiness`),
   einvoice: (id: number) => api.get<EInvoicePayload>(`${V1}/invoices/${id}/einvoice`),
   recordIrn: (id: number, body: IrnRecordRequest) => api.post<Invoice>(`${V1}/invoices/${id}/irn`, body),
+  /** Files the invoice with the IRP and stores the IRN it returns. */
+  submitEinvoice: (id: number) => api.post<IrpSubmissionResult>(`${V1}/invoices/${id}/einvoice/submit`),
+  /** Cancels the IRN at the portal — only within its 24-hour window. */
+  cancelIrn: (id: number, body: IrnCancelRequest) => api.post<Invoice>(`${V1}/invoices/${id}/einvoice/cancel`, body),
+  /** Which IRP backend this deployment files with, and whether it is live. */
+  irpStatus: () => api.get<IrpStatus>(`${V1}/invoices/irp/status`),
 };
 
 export const gstApi = {
@@ -90,6 +109,17 @@ export const gstApi = {
 };
 
 export const documentsApi = {
+  /**
+   * Uploads a document and returns at once (202) with `status: "pending"`.
+   * OCR runs on the server afterwards — poll `get(id)` until the status is
+   * `processed` or `failed`. Prefer this over `ocrApi.extract`, which holds
+   * the connection open for the whole parse (~40s for one page).
+   */
+  upload: (file: File, options: OcrExtractOptions = {}) => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    return api.upload<StoredDocument>(`${V1}/documents/`, form, options);
+  },
   list: () => api.get<StoredDocumentSummary[]>(`${V1}/documents/`),
   get: (id: number) => api.get<StoredDocument>(`${V1}/documents/${id}`),
   /** Original upload as a Blob (needs the auth header, so not a plain link). */
@@ -100,9 +130,41 @@ export const documentsApi = {
 
 export const ocrApi = {
   status: () => api.get<OcrStatus>(`${V1}/ocr/status`),
+  /** Synchronous parse — blocks until the engine finishes. Prefer documentsApi.upload. */
   extract: (file: File, options: OcrExtractOptions = {}) => {
     const form = new FormData();
     form.append("file", file, file.name);
     return api.upload<OcrDocument>(`${V1}/ocr/extract`, form, options);
   },
 };
+
+// Type alias (not interface) so it is assignable to the client's query record.
+export type AuditListParams = {
+  page?: number;
+  size?: number;
+  action?: string;
+  entity_type?: string;
+  entity_id?: string;
+  actor_id?: number | "";
+  date_from?: string;
+  date_to?: string;
+  /** Admins only: "all" reads every workspace instead of the current one. */
+  scope?: "workspace" | "all";
+};
+
+export const auditApi = {
+  list: (params: AuditListParams) => api.get<PaginatedAuditEvents>(`${V1}/audit/`, params),
+  /** The catalogue of action values, for the filter menu. */
+  actions: () => api.get<string[]>(`${V1}/audit/actions`),
+  /** CSV of the current filter; a Blob because the request needs the auth header. */
+  exportCsv: (params: AuditListParams) => {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
+    }
+    const suffix = query.toString();
+    return api.blob(`${V1}/audit/export.csv${suffix ? `?${suffix}` : ""}`);
+  },
+};
+
+export type { AuditEvent };

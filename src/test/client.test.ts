@@ -64,7 +64,7 @@ describe("api client", () => {
   });
 
   it("refreshes once on 401 and retries the original request", async () => {
-    tokenStore.set("old-access", "refresh-1");
+    tokenStore.set("old-access");
     const handler = vi.fn();
     window.addEventListener("auth:expired", handler);
     const json = (status: number, body: unknown) => ({
@@ -73,23 +73,25 @@ describe("api client", () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(json(401, { error: "INVALID_TOKEN", detail: "expired" }))
-      .mockResolvedValueOnce(json(200, { access_token: "new-access", refresh_token: "refresh-2" }))
+      .mockResolvedValueOnce(json(200, { access_token: "new-access", refresh_token: null }))
       .mockResolvedValueOnce(json(200, { id: 7 }));
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(request("/api/v1/auth/me")).resolves.toEqual({ id: 7 });
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls[1][0]).toBe("/api/v1/auth/refresh");
-    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ refresh_token: "refresh-1" });
+    // No body and no token in it: the refresh token is in the HttpOnly cookie,
+    // which the browser attaches because the request sends credentials.
+    expect(fetchMock.mock.calls[1][1].body).toBeUndefined();
+    expect(fetchMock.mock.calls[1][1].credentials).toBe("include");
     expect(fetchMock.mock.calls[2][1].headers.Authorization).toBe("Bearer new-access");
     expect(tokenStore.get()).toBe("new-access");
-    expect(tokenStore.getRefresh()).toBe("refresh-2");
     expect(handler).not.toHaveBeenCalled();
     window.removeEventListener("auth:expired", handler);
   });
 
   it("logs out when the refresh itself fails, and never loops", async () => {
-    tokenStore.set("old-access", "refresh-dead");
+    tokenStore.set("old-access");
     const handler = vi.fn();
     window.addEventListener("auth:expired", handler);
     const fetchMock = mockFetch(401, { error: "INVALID_TOKEN", detail: "expired" });
@@ -98,6 +100,31 @@ describe("api client", () => {
     expect(handler).toHaveBeenCalledTimes(1);
     expect(tokenStore.get()).toBeNull();
     window.removeEventListener("auth:expired", handler);
+  });
+
+  it("keeps the access token out of localStorage entirely", () => {
+    tokenStore.set("in-memory-only");
+    expect(tokenStore.get()).toBe("in-memory-only");
+    // An injected script that reads storage must find nothing worth having.
+    expect(Object.keys(localStorage).some((k) => k.startsWith("einvoice.token"))).toBe(false);
+    expect(JSON.stringify(localStorage)).not.toContain("in-memory-only");
+  });
+
+  it("tries a refresh on 401 even with no access token in hand", async () => {
+    // After a reload there is no access token, but the refresh cookie may
+    // still be valid — the session has to be recoverable from it alone.
+    const json = (status: number, body: unknown) => ({
+      ok: status < 300, status, statusText: "s", headers: new Headers(), text: () => Promise.resolve(JSON.stringify(body)), json: () => Promise.resolve(body),
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(json(401, { error: "INVALID_TOKEN", detail: "no token" }))
+      .mockResolvedValueOnce(json(200, { access_token: "restored", refresh_token: null }))
+      .mockResolvedValueOnce(json(200, { id: 3 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(request("/api/v1/auth/me")).resolves.toEqual({ id: 3 });
+    expect(tokenStore.get()).toBe("restored");
   });
 
   it("sends X-Workspace-Id only while an admin has switched workspace", async () => {
