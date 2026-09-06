@@ -11,6 +11,7 @@ describe("role → permission matrix (mirrors backend app/core/permissions.py)",
       expect(can(userOf(role), "irn:record")).toBe(true);
       expect(can(userOf(role), "users:manage")).toBe(true);
       expect(can(userOf(role), "invoices:delete")).toBe(true);
+      expect(can(userOf(role), "audit:read")).toBe(true);
     }
   });
 
@@ -24,6 +25,9 @@ describe("role → permission matrix (mirrors backend app/core/permissions.py)",
     expect(can(eng, "irn:record")).toBe(false);
     expect(can(eng, "seller_profile:write")).toBe(false);
     expect(can(eng, "users:manage")).toBe(false);
+    // The trail names other members and carries before/after values an
+    // engineer cannot otherwise see.
+    expect(can(eng, "audit:read")).toBe(false);
   });
 
   it("client users are read-only", () => {

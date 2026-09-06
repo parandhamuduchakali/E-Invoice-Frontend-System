@@ -9,9 +9,44 @@ export interface TokenResponse {
   access_token: string;
   token_type: string;
   expires_in: number;
-  /** Long-lived token for POST /auth/refresh. */
-  refresh_token: string;
+  /**
+   * Null in the default backend configuration: the refresh token is delivered
+   * as an HttpOnly cookie so page scripts cannot read it. Only populated when
+   * the server runs with `REFRESH_TOKEN_IN_BODY=true` for API clients.
+   */
+  refresh_token: string | null;
   refresh_expires_in: number;
+}
+
+/** One row of the append-only audit trail (`GET /api/v1/audit/`). */
+export interface AuditEvent {
+  id: number;
+  occurred_at: string;
+  workspace_id: number | null;
+  actor_id: number | null;
+  actor_email: string | null;
+  actor_role: string | null;
+  /** Namespaced action, e.g. `invoice.irn_recorded`. */
+  action: string;
+  entity_type: string;
+  entity_id: string | null;
+  summary: string;
+  /**
+   * `{field: {from, to}}` for updates, or free-form context for other actions.
+   * Secrets are stripped and long values abbreviated server-side.
+   */
+  changes: Record<string, unknown> | null;
+  request_id: string | null;
+  ip_address: string | null;
+  user_agent: string | null;
+}
+
+export interface PaginatedAuditEvents {
+  items: AuditEvent[];
+  total: number;
+  page: number;
+  size: number;
+  pages: number;
 }
 
 export type UserRole = "admin" | "manager" | "engineer" | "client";
@@ -228,6 +263,13 @@ export interface Invoice {
   ack_no: string | null;
   ack_date: string | null;
   signed_qr_code: string | null;
+  signed_invoice: string | null;
+  /** Which backend registered it: `nic` (filed) or `mock` (simulated locally). */
+  irp_backend: string | null;
+  irp_submitted_at: string | null;
+  irn_cancelled_at: string | null;
+  irn_cancel_reason: string | null;
+  irn_cancel_remarks: string | null;
   notes: string | null;
   terms: string | null;
   created_at: string;
@@ -317,6 +359,93 @@ export interface OcrPage {
   text: string;
 }
 
+/** One row of the scanned invoice's item table, recovered from the OCR layout. */
+export interface ExtractedLineItem {
+  description: string;
+  hsn_code: string | null;
+  quantity: number | null;
+  unit: string | null;
+  unit_price: number | null;
+  discount: number | null;
+  gst_rate: number | null;
+  /** Row amount as printed — the taxable value where the table prints one. */
+  amount: number | null;
+  /** Mean OCR confidence of the cells this row was built from. */
+  confidence: number;
+  /** Why the row should not be trusted as-is; empty means it reconciles. */
+  warnings: string[];
+}
+
+/** One party named on a scanned document. Every field is null when unread. */
+export interface ExtractedParty {
+  legal_name: string | null;
+  trade_name: string | null;
+  gstin: string | null;
+  address: string | null;
+  place: string | null;
+  state: string | null;
+  state_code: string | null;
+  pincode: string | null;
+}
+
+export interface ExtractedDocumentDetails {
+  document_type: string | null;
+  document_type_label: string | null;
+  document_number: string | null;
+  document_date: string | null;
+  preceding_invoice_number: string | null;
+  preceding_invoice_date: string | null;
+  irn: string | null;
+  ack_no: string | null;
+  ack_date: string | null;
+  supply_type: string | null;
+  is_service: boolean | null;
+  place_of_supply: string | null;
+  place_of_supply_code: string | null;
+  reverse_charge: boolean | null;
+  currency: string | null;
+}
+
+export interface ExtractedTaxTotals {
+  assessable_value: number | null;
+  igst_value: number | null;
+  cgst_value: number | null;
+  sgst_value: number | null;
+  total_invoice_value: number | null;
+  round_off: number | null;
+}
+
+/** Why a field holds the value it does — shown beside it so a reviewer can rank what to check. */
+export interface ExtractedFieldEvidence {
+  field_name: string;
+  value: unknown;
+  matched_label: string | null;
+  /** How it was found: label / layout / pattern / fuzzy / derived / context. */
+  method: string;
+  /** 0-1, ordinal rather than calibrated. Not a probability. */
+  confidence: number;
+  section: string;
+}
+
+/**
+ * The scanned document with every value attributed to its role.
+ *
+ * `ExtractedInvoiceFields` below says *what* is on the page — every GSTIN,
+ * every date. This says *whose*: which GSTIN is the supplier's and which the
+ * buyer's. Fields with no evidence are null rather than guessed.
+ */
+export interface StructuredInvoice {
+  document: ExtractedDocumentDetails;
+  supplier: ExtractedParty;
+  recipient: ExtractedParty;
+  shipping: ExtractedParty;
+  dispatch: ExtractedParty;
+  totals: ExtractedTaxTotals;
+  /** Cross-field checks that did not hold. */
+  warnings: string[];
+  evidence: ExtractedFieldEvidence[];
+}
+
 export interface ExtractedInvoiceFields {
   gstins: string[];
   invalid_gstins: string[];
@@ -332,7 +461,11 @@ export interface ExtractedInvoiceFields {
   state_codes: string[];
   reverse_charge: boolean | null;
   currency: string | null;
+  /** Item table rows; empty when the engine returned no box positions. */
+  line_items: ExtractedLineItem[];
   key_values: Record<string, string[]>;
+  /** Role-assigned view of the same document; prefer this when building an invoice. */
+  structured: StructuredInvoice;
 }
 
 export interface OcrDocument {
@@ -347,6 +480,31 @@ export interface OcrDocument {
   pages: OcrPage[];
   full_text: string;
   extracted_fields: ExtractedInvoiceFields;
+}
+
+/** What `GET /invoices/irp/status` reports about this deployment. */
+export interface IrpStatus {
+  backend: string;
+  /** False = submissions are simulated in-process; nothing reaches the government. */
+  live: boolean;
+  base_url: string;
+  gstin: string;
+  cancel_window_hours: number;
+  /** Reason code to label, for the cancellation form. */
+  cancel_reasons: Record<string, string>;
+}
+
+export interface IrpSubmissionResult {
+  invoice: Invoice;
+  /** The portal already held this document; the existing registration was adopted. */
+  duplicate: boolean;
+  backend: string;
+  live: boolean;
+}
+
+export interface IrnCancelRequest {
+  reason_code: "1" | "2" | "3" | "4";
+  remarks: string;
 }
 
 export interface OcrStatus {

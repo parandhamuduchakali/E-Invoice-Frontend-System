@@ -78,6 +78,10 @@ export const CheckIcon = (p: IconProps) => (
 export const AlertIcon = (p: IconProps) => (
   <Svg {...p}><path d="M12 3 2.5 20h19L12 3Z" /><path d="M12 10v4M12 17.5v.5" /></Svg>
 );
+/** Clock with a rewind arrow — the audit trail. */
+export const HistoryIcon = (p: IconProps) => (
+  <Svg {...p}><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /><path d="M12 7.5V12l3 2" /></Svg>
+);
 
 /** Initials avatar used in the top bar and user menu. */
 export function Avatar({ name, size = 36 }: { name: string; size?: number }) {

@@ -1,7 +1,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useRef, useState, type DragEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { ocrApi } from "@/api/endpoints";
+import { documentsApi, ocrApi } from "@/api/endpoints";
 import type { OcrDocument, OcrExtractOptions } from "@/api/types";
 import { useAuth } from "@/auth/AuthContext";
 import { Card, Checkbox, ErrorBanner, Field, InfoBanner, Input, KeyValue, PageHeader, Spinner } from "@/components/ui";
@@ -21,7 +21,51 @@ export function OcrPage() {
   const [showLines, setShowLines] = useState(false);
 
   const status = useQuery({ queryKey: ["ocr", "status"], queryFn: ocrApi.status, staleTime: 60_000 });
-  const extract = useMutation({ mutationFn: (f: File) => ocrApi.extract(f, options), onSuccess: setResult });
+
+  // The upload returns a job id straight away; OCR runs on the server. Polling
+  // the document is what tells us it finished — a synchronous call would hold
+  // the connection open for the whole parse (~40s for a single page), which
+  // browsers and proxies time out.
+  const [jobId, setJobId] = useState<number | null>(null);
+
+  const job = useQuery({
+    queryKey: ["documents", jobId],
+    queryFn: () => documentsApi.get(jobId!),
+    enabled: jobId !== null,
+    refetchInterval: (query) => (query.state.data?.status === "pending" ? 2000 : false),
+  });
+
+  const extract = useMutation({
+    mutationFn: (f: File) => documentsApi.upload(f, options),
+    onSuccess: (document) => {
+      setResult(null);
+      setJobId(document.id);
+    },
+  });
+
+  // A finished job carries the same fields the synchronous endpoint returned.
+  useEffect(() => {
+    const document = job.data;
+    if (!document || document.status === "pending") return;
+    setResult(
+      document.status === "processed" && document.extracted_fields
+        ? ({
+            document_id: document.id,
+            duplicate: false,
+            filename: document.filename,
+            source_type: document.content_type === "application/pdf" ? "pdf" : "image",
+            engine: document.engine ?? "",
+            page_count: document.page_count,
+            pages: [],
+            full_text: document.full_text ?? "",
+            extracted_fields: document.extracted_fields,
+          } as OcrDocument)
+        : null,
+    );
+  }, [job.data]);
+
+  const working = extract.isPending || job.data?.status === "pending" || (jobId !== null && job.isPending);
+  const failed = job.data?.status === "failed" ? job.data.error : null;
 
   function pick(files: FileList | null) {
     const f = files?.[0] ?? null;
@@ -94,13 +138,14 @@ export function OcrPage() {
           </fieldset>
 
           <div className="row">
-            <button type="button" className="btn primary" disabled={!file || extract.isPending || Boolean(tooBig) || status.data?.available === false} onClick={() => file && extract.mutate(file)}>
-              {extract.isPending ? "Recognising… (about a minute per page on CPU)" : "Extract text"}
+            <button type="button" className="btn primary" disabled={!file || working || Boolean(tooBig) || status.data?.available === false} onClick={() => file && extract.mutate(file)}>
+              {working ? "Recognising… (about a minute per page on CPU)" : "Extract text"}
             </button>
             {file && <button type="button" className="btn" onClick={() => pick(null)}>Clear</button>}
             {status.data && <span className="muted small">Engine: {status.data.engine} · {status.data.profile} · {status.data.lang}</span>}
           </div>
           <ErrorBanner error={extract.error} onDismiss={() => extract.reset()} />
+          {failed && <InfoBanner tone="warn">OCR failed: {failed} You can retry it from the Documents page.</InfoBanner>}
           {result?.document_id && (
             <InfoBanner tone={result.duplicate ? "warn" : "success"}>
               <div>
@@ -112,7 +157,7 @@ export function OcrPage() {
         </Card>
 
         <Card title="Extracted GST fields" actions={result && <span className="muted small">{result.page_count} page{result.page_count === 1 ? "" : "s"} · {result.pages.reduce((n, p) => n + p.lines.length, 0)} lines</span>}>
-          {extract.isPending ? (
+          {working ? (
             <Spinner label="Running OCR…" />
           ) : !fields ? (
             <p className="muted">Upload a document to see invoice number, dates, GSTINs, HSN codes, totals and place of supply.</p>
@@ -134,6 +179,47 @@ export function OcrPage() {
                   ["Currency", fields.currency ?? "—"],
                 ]}
               />
+
+              {fields.line_items.length > 0 && (
+                <div style={{ marginTop: "1rem" }}>
+                  <h4 style={{ margin: "0 0 0.5rem" }}>Item table ({fields.line_items.length} rows)</h4>
+                  <p className="muted small" style={{ marginTop: 0 }}>
+                    Read from the document's own table layout. These become the invoice's line items — check them.
+                  </p>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Description</th><th>HSN / SAC</th><th className="num">Qty</th>
+                          <th>Unit</th><th className="num">Rate</th><th className="num">GST</th><th className="num">Amount</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {fields.line_items.map((row, index) => (
+                          <tr key={`${row.description}-${index}`}>
+                            <td>
+                              {row.description || "—"}
+                              {row.warnings.length > 0 && (
+                                <div className="muted small" style={{ color: "var(--warn-fg, #92400e)" }}>
+                                  {row.warnings.map((w) => (
+                                    <div key={w}>⚠ {w}</div>
+                                  ))}
+                                </div>
+                              )}
+                            </td>
+                            <td>{row.hsn_code ?? "—"}</td>
+                            <td className="num">{row.quantity ?? "—"}</td>
+                            <td>{row.unit ?? "—"}</td>
+                            <td className="num">{row.unit_price !== null ? money(row.unit_price) : "—"}</td>
+                            <td className="num">{row.gst_rate !== null ? `${row.gst_rate}%` : "—"}</td>
+                            <td className="num">{row.amount !== null ? money(row.amount) : "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
 
               {draft && (
                 <div style={{ marginTop: "1rem" }}>

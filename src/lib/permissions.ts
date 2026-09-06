@@ -19,11 +19,12 @@ export type Permission =
   | "seller_profile:write"
   | "ocr:run"
   | "users:manage"
+  | "audit:read"
   | "dashboard:view";
 
 const ALL: Permission[] = [
   "clients:read", "clients:write", "clients:delete", "invoices:read", "invoices:write", "invoices:delete",
-  "einvoice:generate", "irn:record", "seller_profile:write", "ocr:run", "users:manage", "dashboard:view",
+  "einvoice:generate", "irn:record", "seller_profile:write", "ocr:run", "users:manage", "audit:read", "dashboard:view",
 ];
 
 export const ROLE_PERMISSIONS: Record<UserRole, ReadonlySet<Permission>> = {

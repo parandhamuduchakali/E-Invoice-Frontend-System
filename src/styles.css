@@ -329,3 +329,13 @@ pre.json { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: va
   .content { padding: 0; max-width: none; }
   .paper { border: 0; box-shadow: none; padding: 0; }
 }
+
+/* Fills the remaining width of a flex .row (the customer picker beside the
+   button that consumes it). */
+.grow { flex: 1 1 16rem; }
+
+/* ── Audit trail ──────────────────────────────────────────────────────── */
+/* The expanded "what changed" row under an event. */
+.audit-detail { background: var(--surface-2, rgba(0, 0, 0, 0.03)); padding: 0.6rem 0.9rem; }
+.audit-change { padding: 0.15rem 0; }
+.audit-change del { opacity: 0.65; text-decoration-thickness: 1px; }

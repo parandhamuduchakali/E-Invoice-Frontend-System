@@ -1,5 +1,11 @@
 /**
- * Authentication state: JWT in storage, current user loaded from /auth/me.
+ * Authentication state: an in-memory access token and the user behind it.
+ *
+ * Nothing about the session is persisted by this app. On boot it asks the
+ * server to trade the HttpOnly refresh cookie for a fresh access token
+ * (`refreshSession`), then loads `/auth/me`; a visitor with no cookie simply
+ * lands on the login page. See `src/api/client.ts` for why the long-lived
+ * token is kept out of JavaScript's reach.
  *
  * Any API call that returns 401 dispatches `auth:expired`, which clears the
  * session so the router redirects to the login page.
@@ -8,7 +14,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { authApi, usersApi } from "@/api/endpoints";
-import { tokenStore, workspaceStore } from "@/api/client";
+import { refreshSession, tokenStore, workspaceStore } from "@/api/client";
 import type { User } from "@/api/types";
 
 interface AuthState {
@@ -19,7 +25,7 @@ interface AuthState {
    * engineers and client users.
    */
   seller: User | null;
-  /** True until the stored token has been checked against /auth/me. */
+  /** True until the refresh cookie has been checked against /auth/me. */
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, fullName: string, password: string) => Promise<void>;
@@ -38,16 +44,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [seller, setSeller] = useState<User | null>(null);
   const [workspace, setWorkspaceState] = useState<User | null>(null);
-  const [loading, setLoading] = useState<boolean>(Boolean(tokenStore.get()));
+  // Always true on mount: whether a session exists is a question only the
+  // server can answer now, because the cookie that proves it is unreadable here.
+  const [loading, setLoading] = useState<boolean>(true);
   const queryClient = useQueryClient();
 
   const logout = useCallback(() => {
+    // Drop local state first so the UI never waits on the network to sign out,
+    // then ask the server to clear the refresh cookie. Without that call the
+    // cookie would outlive the session and the next reload would silently
+    // sign the user back in.
     tokenStore.clear();
     workspaceStore.set(null);
     setUser(null);
     setSeller(null);
     setWorkspaceState(null);
     queryClient.clear();
+    void authApi.logout().catch(() => undefined);
   }, [queryClient]);
 
   const loadSeller = useCallback(async (me: User) => {
@@ -83,20 +96,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await loadSeller(me);
   }, [loadSeller]);
 
-  // Validate a stored token on first load.
+  // Restore the session on first load: the access token is gone after a
+  // reload, but the refresh cookie may still be good.
   useEffect(() => {
-    if (!tokenStore.get()) {
-      setLoading(false);
-      return;
-    }
-    authApi
-      .me()
-      .then(async (me) => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (!(await refreshSession())) return;
+        const me = await authApi.me();
+        if (cancelled) return;
         setUser(me);
         await loadSeller(me);
-      })
-      .catch(() => tokenStore.clear())
-      .finally(() => setLoading(false));
+      } catch {
+        tokenStore.clear();
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [loadSeller]);
 
   // Central 401 handling.
@@ -109,7 +128,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = useCallback(
     async (email: string, password: string) => {
       const token = await authApi.login(email, password);
-      tokenStore.set(token.access_token, token.refresh_token);
+      // The matching refresh token arrived as a cookie the browser stores for us.
+      tokenStore.set(token.access_token);
       await refreshUser();
     },
     [refreshUser],

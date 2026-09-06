@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      # tsc in --noEmit mode: the build below would catch type errors too, but
+      # a separate step names the failure instead of burying it in a bundle log.
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The entry bundle is what a first visit downloads before anything
+      # renders. Routes are code-split to keep it down (see src/App.tsx), and
+      # this fails the build if that regresses rather than letting it drift.
+      - name: Entry bundle stays under budget
+        run: |
+          BUDGET_KB=340
+          ENTRY=$(ls -S dist/assets/index-*.js | head -1)
+          SIZE_KB=$(( $(stat -c%s "$ENTRY") / 1024 ))
+          echo "entry bundle: $ENTRY = ${SIZE_KB} KB (budget ${BUDGET_KB} KB)"
+          if [ "$SIZE_KB" -gt "$BUDGET_KB" ]; then
+            echo "::error::Entry bundle ${SIZE_KB} KB exceeds the ${BUDGET_KB} KB budget."
+            exit 1
+          fi

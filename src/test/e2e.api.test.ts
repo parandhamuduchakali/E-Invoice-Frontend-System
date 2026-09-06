@@ -17,13 +17,36 @@ import { authApi, clientsApi, documentsApi, gstApi, invoicesApi, ocrApi, usersAp
 const BASE = process.env.E2E_BASE_URL;
 const OCR_FILE = process.env.E2E_OCR_FILE;
 
-// Node has no localStorage; give tokenStore a tiny in-memory one.
+// Node has no localStorage; give the workspace store a tiny in-memory one.
 const memory = new Map<string, string>();
 (globalThis as Record<string, unknown>).localStorage = {
   getItem: (k: string) => memory.get(k) ?? null,
   setItem: (k: string, v: string) => void memory.set(k, v),
   removeItem: (k: string) => void memory.delete(k),
 };
+
+// Nor does node's fetch keep cookies, and the refresh token is now delivered
+// only as an HttpOnly cookie. This jar is what a browser would do for us:
+// remember Set-Cookie, replay it on the next request. Attribute handling is
+// deliberately minimal (name=value, last write wins) — enough to exercise the
+// real refresh flow, not a cookie implementation.
+const jar = new Map<string, string>();
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+  const headers = new Headers(init.headers);
+  if (jar.size > 0) headers.set("cookie", [...jar].map(([k, v]) => `${k}=${v}`).join("; "));
+  const response = await nativeFetch(input, { ...init, headers });
+  for (const raw of response.headers.getSetCookie?.() ?? []) {
+    const [pair] = raw.split(";");
+    const index = pair.indexOf("=");
+    const name = pair.slice(0, index).trim();
+    const value = pair.slice(index + 1).trim().replace(/^"|"$/g, "");
+    // A cleared cookie arrives as an empty value with Max-Age=0.
+    if (!value || /max-age=0\b/i.test(raw)) jar.delete(name);
+    else jar.set(name, value);
+  }
+  return response;
+}) as typeof fetch;
 
 const SELLER_GSTIN = "27AAPFU0939F1ZV"; // Maharashtra
 const BUYER_GSTIN = "27AAACR5055K1Z7"; // Maharashtra → intra-state → CGST + SGST
@@ -41,16 +64,18 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
     await authApi.register(`bootstrap-${stamp}@example.com`, "Bootstrap", "password123").catch(() => undefined);
     await authApi.register(email, "Frontend E2E", "password123");
     const token = await authApi.login(email, "password123");
-    tokenStore.set(token.access_token, token.refresh_token);
+    tokenStore.set(token.access_token);
   });
 
-  it("refreshes the session with the refresh token", async () => {
-    const refreshToken = tokenStore.getRefresh();
-    expect(refreshToken).toBeTruthy();
-    const renewed = await authApi.refresh(refreshToken!);
+  it("refreshes the session from the HttpOnly cookie, never from the body", async () => {
+    // The long-lived credential must not be reachable from JavaScript.
+    expect(jar.has("einvoice_refresh")).toBe(true);
+
+    const renewed = await authApi.refresh();
     expect(renewed.access_token).toBeTruthy();
+    expect(renewed.refresh_token).toBeNull();
     expect(renewed.refresh_expires_in).toBeGreaterThan(renewed.expires_in);
-    tokenStore.set(renewed.access_token, renewed.refresh_token);
+    tokenStore.set(renewed.access_token);
     expect((await authApi.me()).email).toBe(email);
 
     // A dead access token is transparently refreshed and the call retried.
@@ -58,7 +83,15 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
     expect((await authApi.me()).email).toBe(email);
     expect(tokenStore.get()).not.toBe("expired.access.token");
 
-    await expect(authApi.refresh(tokenStore.get()!)).rejects.toMatchObject({ status: 401 }); // access token is not a refresh token
+    // Signing out clears the cookie, so the session cannot be renewed after it.
+    const live = tokenStore.get()!;
+    await authApi.logout();
+    expect(jar.has("einvoice_refresh")).toBe(false);
+    await expect(authApi.refresh()).rejects.toMatchObject({ status: 401 });
+
+    // Sign back in for the rest of the suite.
+    tokenStore.set((await authApi.login(email, "password123")).access_token);
+    expect(live).toBeTruthy();
   });
 
   it("loads the current user and GST reference data", async () => {
@@ -209,7 +242,6 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
 
     // Manager creates an engineer and a client-portal user in this workspace.
     const managerToken = tokenStore.get()!;
-    const managerRefresh = tokenStore.getRefresh();
     const eng = await usersApi.create({ email: `eng-${stamp}@example.com`, full_name: "Eng", password: "password123", role: "engineer" });
     expect(eng.role).toBe("engineer");
     const portal = await usersApi.create({ email: `portal-${stamp}@example.com`, full_name: "Portal", password: "password123", role: "client", client_id: second.id });
@@ -218,23 +250,36 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
 
     // Engineer: sees the manager's data and seller profile, cannot delete or record IRN.
     const engTokens = await authApi.login(eng.email, "password123");
-    tokenStore.set(engTokens.access_token, engTokens.refresh_token);
+    tokenStore.set(engTokens.access_token);
     expect((await clientsApi.list()).length).toBe(2);
     expect((await usersApi.workspace()).gstin).toBe(SELLER_GSTIN); // manager's seller profile, for tax previews
     await expect(invoicesApi.remove(invoiceId)).rejects.toMatchObject({ status: 403, code: "PERMISSION_DENIED" });
     await expect(usersApi.list()).rejects.toMatchObject({ status: 403 });
-    // Own password change, then the old password stops working.
-    await usersApi.changePassword({ current_password: "password123", new_password: "engineer-new-pw1" });
+    // Own password change: the old password stops working, every earlier
+    // session is revoked, and the returned pair keeps this caller signed in.
+    const staleToken = engTokens.access_token;
+    const rotated = await usersApi.changePassword({ current_password: "password123", new_password: "engineer-new-pw1" });
+    expect(rotated.access_token).not.toBe(staleToken);
+    tokenStore.set(rotated.access_token);
+    expect((await authApi.me()).email).toBe(eng.email);
+
+    // Checked with a bare request, not through the API client: the client
+    // would notice the 401, spend this device's still-valid refresh cookie and
+    // hand back a working session, which is correct behaviour but hides the
+    // thing under test.
+    const stale = await nativeFetch(`${BASE}/api/v1/auth/me`, { headers: { Authorization: `Bearer ${staleToken}` } });
+    expect(stale.status).toBe(401);
+
     await expect(authApi.login(eng.email, "password123")).rejects.toMatchObject({ status: 401 });
     await authApi.login(eng.email, "engineer-new-pw1");
 
     // Deleting a client that has invoices is a conflict, not a crash.
-    tokenStore.set(managerToken, managerRefresh);
+    tokenStore.set(managerToken);
     await expect(clientsApi.remove(clientId)).rejects.toMatchObject({ status: 409, code: "CONFLICT" });
 
     // Client-portal user: only its own client and invoices, read-only.
     const portalTokens = await authApi.login(portal.email, "password123");
-    tokenStore.set(portalTokens.access_token, portalTokens.refresh_token);
+    tokenStore.set(portalTokens.access_token);
     expect((await clientsApi.list()).map((c) => c.id)).toEqual([second.id]);
     const mine = await invoicesApi.list({});
     expect(mine.total).toBe(1);
@@ -245,7 +290,7 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
     expect(scoped.client_id).toBe(second.id);
     await expect(ocrApi.status()).rejects.toMatchObject({ status: 403 });
 
-    tokenStore.set(managerToken, managerRefresh);
+    tokenStore.set(managerToken);
   }, 60_000);
 
   it("admins may act on another workspace with X-Workspace-Id; managers may not", async () => {
@@ -258,7 +303,7 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
     // The bootstrap account is the platform admin on a fresh database.
     const mine = tokenStore.get()!;
     const adminTokens = await authApi.login(`bootstrap-${stamp}@example.com`, "password123");
-    tokenStore.set(adminTokens.access_token, adminTokens.refresh_token);
+    tokenStore.set(adminTokens.access_token);
     try {
       const admin = await authApi.me();
       if (admin.role === "admin") {
@@ -281,8 +326,9 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
   }, 60_000);
 
   it("forgot-password answers 202 without revealing accounts; bad reset tokens are 400", async () => {
-    await expect(authApi.forgotPassword(`nobody-${stamp}@example.com`)).resolves.toBeUndefined();
-    await expect(authApi.forgotPassword(email)).resolves.toBeUndefined(); // link goes to the server log (console mailer)
+    // 202 with an empty body parses to null (204 is what yields undefined).
+    await expect(authApi.forgotPassword(`nobody-${stamp}@example.com`)).resolves.toBeNull();
+    await expect(authApi.forgotPassword(email)).resolves.toBeNull(); // link goes to the server log (console mailer)
     await expect(authApi.resetPassword("definitely-not-a-real-token-value", "another-password-1")).rejects.toMatchObject({ status: 400, code: "BAD_REQUEST" });
   });
 
