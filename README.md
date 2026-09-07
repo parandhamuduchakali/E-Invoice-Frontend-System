@@ -71,9 +71,20 @@ VITE_API_BASE_URL=https://api.example.com npm run build
 
 ### Contract
 
-`src/api/types.ts` mirrors the backend's Pydantic schemas with identical snake_case names, and
-`src/lib/invoiceMath.ts` duplicates the backend's rounding so the live totals match what gets saved.
-Change both together when the API changes.
+The backend's OpenAPI document is the source of truth, and the frontend is checked against it twice:
+
+1. **`npm run gen:api`** regenerates `src/api/schema.d.ts` from `../E-Invoice-Backend-system/docs/openapi.json`
+   (or a URL / path you pass). The generated file is committed, and CI regenerates it and fails on a diff —
+   so a backend change nobody regenerated for is caught.
+2. **`src/api/contract.ts`** asserts, at compile time, that every hand-written type in `src/api/types.ts`
+   has exactly the keys of the schema it mirrors. Rename a field on the server and `tsc` fails on that
+   file naming the field, instead of a page rendering `undefined`.
+
+The hand-written types stay because they carry the documentation and the narrower unions the pages rely
+on; the generated file is what keeps them honest.
+
+`src/lib/invoiceMath.ts` still duplicates the backend's rounding so the live totals match what gets saved
+— the server's figures are the ones stored, and the e2e test checks the two agree to the paisa.
 
 The rounding has to agree to the paisa. The backend computes in `Decimal` with `ROUND_HALF_UP`, which is
 what `round2` here does with its `Number.EPSILON` nudge — Python's built-in `round()` is banker's rounding
@@ -103,6 +114,11 @@ Two consequences worth knowing:
 The only thing this app persists is `einvoice.workspace`, the workspace id an admin has switched to — a
 preference, not a credential.
 
+**Second factor.** `login()` in `AuthContext` resolves to `null` once a session exists, or to an `MfaChallenge`
+when the account has TOTP enabled; the login page then asks for the code and calls `completeMfa`. Enrolment lives
+on **Profile** (`MfaCard`): the otpauth URL is rendered as a QR with `src/components/QrCode.tsx`, the first code
+confirms it, and the eight recovery codes are shown exactly once.
+
 ---
 
 ## Scripts
@@ -112,6 +128,7 @@ preference, not a credential.
 | `npm run dev` | Vite dev server with `/api` proxy |
 | `npm run dev:all` / `dev:all:sh` | Backend + frontend together |
 | `npm run build` | Type-check + production bundle to `dist/` |
+| `npm run gen:api` | Regenerate `src/api/schema.d.ts` from the backend's OpenAPI contract |
 | `npm run preview` | Serve `dist/` locally |
 | `npm test` | Unit tests (GST checksum, invoice math, OCR→invoice mapping, API client) |
 | `npm run lint` | TypeScript type-check |
@@ -161,11 +178,11 @@ split on the invoice form matches what the backend computes.
 |---|---|---|
 | `/login`, `/register`, `/forgot-password`, `/reset-password` | JWT auth. The access token lives in memory only; the refresh token is an `HttpOnly` cookie the browser keeps and no script can read — see [Session tokens](#session-tokens). A 401 triggers one silent `POST /auth/refresh` and retries the call; if that fails the session is cleared | `POST /auth/login`, `POST /auth/register`, `POST /auth/refresh`, `POST /auth/logout`, `POST /auth/forgot-password`, `POST /auth/reset-password`, `GET /auth/me` |
 | `/` Dashboard | Stat cards, then a master-detail view: invoice cards on the left (status filter, **New +**), a printable invoice preview on the right (seller block, client, total / paid / balance due, items, totals) with **Print** and **Open** | `GET /invoices/stats`, `GET /invoices/`, `GET /invoices/:id` |
-| `/profile` | Seller profile (`SellerDtls`) with live GSTIN check-digit validation and a "still needed for IRP" list | `PATCH /users/me`, `GET /gst/validate-gstin`, `GET /gst/state-codes` |
+| `/profile` | Seller profile (`SellerDtls`) with live GSTIN check-digit validation and a "still needed for IRP" list; change password; **two-factor authentication** (enrol with a QR, recovery codes shown once, disable with a code); **this workspace's own IRP credentials** (owners) | `PATCH /users/me`, `GET /gst/validate-gstin`, `GET /gst/state-codes`, `/auth/mfa/*`, `/invoices/irp/credentials` |
 | `/clients` | Buyers with GSTIN / state / place of supply; create, edit, delete | `/clients` CRUD |
 | `/invoices` | Paginated list, status filter, number search, IRN badge | `GET /invoices/` |
 | `/invoices/new`, `/invoices/:id/edit` | Full GST form: document type, supply type, reverse charge, IGST-on-intra, place of supply, preceding document for notes, ship-to / dispatch-from, line items with HSN/SAC, unit, discount and rate; **live totals with the tax split** | `POST /invoices/`, `PATCH /invoices/:id` |
-| `/invoices/:id` | Detail, status change (dropdown offers only the backend's `allowed_status_transitions`), link to the scanned source document, delete; **e-invoice panel**: readiness checklist with fix links, INV-01 JSON (copy / download), record IRN + ack + signed QR; locked after IRN | `/einvoice/readiness`, `/einvoice`, `/irn` |
+| `/invoices/:id` | Detail (the IRP's **signed QR rendered as an image** on the printable invoice, as the GST rules require; download of the **filed INV-01** frozen at registration), status change (dropdown offers only the backend's `allowed_status_transitions`), link to the scanned source document, delete; **e-invoice panel**: readiness checklist with fix links, INV-01 JSON (copy / download), record IRN + ack + signed QR; locked after IRN | `/einvoice/readiness`, `/einvoice`, `/irn` |
 | `/ocr` | Drag-and-drop PDF / image, OpenCV options, extracted GST fields, and the **item table rebuilt from the page layout** (description, HSN, qty, rate, GST %, amount) with a warning on any row whose arithmetic does not reconcile. **Create invoice from this** pre-fills the form from those rows, incl. `document_id` and `source_reference`, and pre-selects a client by GSTIN. The upload returns immediately and the page polls the document until it is `processed` or `failed` — see [Long-running OCR](#long-running-ocr) | `GET /ocr/status`, `POST /documents/`, `GET /documents/:id` |
 | `/documents` | Every stored upload with status (processed / failed), engine, pages and the invoice it produced; open the file, re-run OCR, create an invoice from a processed scan, delete (blocked while linked) | `/documents` CRUD, `POST /documents/:id/retry`, `GET /documents/:id/file` |
 | `/audit` | Append-only audit trail (managers and admins): who changed what and when, filterable by action, record type and date, each row expandable to the before/after values, plus a CSV export of the current filter. Admins can widen the scope to every workspace | `GET /audit/`, `GET /audit/actions`, `GET /audit/export.csv` |
@@ -204,10 +221,26 @@ total across the HSN codes it found.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every push and pull request: `npm ci`, type-check, tests, build, and a
-**bundle budget**. The budget is the point of the code splitting — without a check, lazy routes quietly
-get pulled back into the entry chunk by a stray top-level import, and nobody notices until first paint is
-slow again. The build fails if the entry bundle passes its ceiling.
+`.github/workflows/ci.yml`:
+
+| Step | What it proves |
+|---|---|
+| `npm audit --audit-level=high` | No known high/critical CVEs in what ships or builds |
+| `npm run gen:api` + `git diff --exit-code` | `src/api/schema.d.ts` matches the backend's committed contract |
+| `npm run lint` (`tsc`) | Types compile — including `src/api/contract.ts`, which fails if a hand-written type drifts from the schema |
+| `npm test` · `npm run build` | The suite passes and the bundle builds |
+| Entry bundle ≤ 340 KB | Code-splitting has not regressed |
+| `gitleaks` (separate job) | No credential in the history — a `VITE_*` secret ends up in every visitor's bundle |
+| `e2e` (separate job) | The API layer against a live backend: auth, refresh cookie, seller profile, client, invoice, INV-01, IRN, RBAC |
+
+The contract step checks out the backend repository beside this one (sparse, just `docs/openapi.json`),
+the same layout `npm run gen:api` assumes on a developer machine. The `e2e` job goes further: it checks out
+the whole backend, starts it, and runs `src/test/e2e.api.test.ts` against it — the one place the two
+repositories are proven to agree at runtime rather than only at the type level.
+
+Both repositories are private, so these cross-repo checkouts need a repository secret **`BACKEND_REPO_TOKEN`**:
+a fine-grained personal access token with read access to `E-Invoice-Backend-system`'s contents. Without it
+the `build` job's contract step and the `e2e` job fail at checkout.
 
 ## Look and feel
 
@@ -225,7 +258,9 @@ src/
 ├── api/
 │   ├── client.ts        fetch wrapper: base URL, in-memory access token, ApiError, auth:expired event
 │   ├── endpoints.ts     authApi, usersApi, clientsApi, invoicesApi, gstApi, documentsApi, ocrApi, auditApi
-│   └── types.ts         TS mirrors of the backend schemas
+│   ├── types.ts         hand-written mirrors of the backend schemas (documented, narrow unions)
+│   ├── schema.d.ts      GENERATED from the backend's OpenAPI contract — npm run gen:api
+│   └── contract.ts      compile-time assertions that types.ts matches schema.d.ts
 ├── auth/AuthContext.tsx session restore from the refresh cookie + current user
 ├── lib/
 │   ├── gst.ts           GSTIN mod-36 check digit, pincode/HSN formats, rate & UQC options

@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import { tokenStore, workspaceStore } from "@/api/client";
+import type { TokenResponse } from "@/api/types";
 import { authApi, clientsApi, documentsApi, gstApi, invoicesApi, ocrApi, usersApi } from "@/api/endpoints";
 
 const BASE = process.env.E2E_BASE_URL;
@@ -48,6 +49,12 @@ globalThis.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => 
   return response;
 }) as typeof fetch;
 
+/** These accounts have no second factor, so a login is always a session. */
+function tokensFrom(result: Awaited<ReturnType<typeof authApi.login>>): TokenResponse {
+  if ("mfa_required" in result) throw new Error("unexpected second-factor challenge in e2e");
+  return result;
+}
+
 const SELLER_GSTIN = "27AAPFU0939F1ZV"; // Maharashtra
 const BUYER_GSTIN = "27AAACR5055K1Z7"; // Maharashtra → intra-state → CGST + SGST
 
@@ -61,9 +68,9 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
     expect(import.meta.env.VITE_API_BASE_URL, "VITE_API_BASE_URL must point at the same server").toBe(BASE);
     // On an empty database the very first account becomes admin. Register a
     // throwaway one first so the account under test is a regular manager.
-    await authApi.register(`bootstrap-${stamp}@example.com`, "Bootstrap", "password123").catch(() => undefined);
-    await authApi.register(email, "Frontend E2E", "password123");
-    const token = await authApi.login(email, "password123");
+    await authApi.register(`bootstrap-${stamp}@example.com`, "Bootstrap", "frontend-e2e-pass-2026").catch(() => undefined);
+    await authApi.register(email, "Frontend E2E", "frontend-e2e-pass-2026");
+    const token = tokensFrom(await authApi.login(email, "frontend-e2e-pass-2026"));
     tokenStore.set(token.access_token);
   });
 
@@ -90,7 +97,7 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
     await expect(authApi.refresh()).rejects.toMatchObject({ status: 401 });
 
     // Sign back in for the rest of the suite.
-    tokenStore.set((await authApi.login(email, "password123")).access_token);
+    tokenStore.set(tokensFrom(await authApi.login(email, "frontend-e2e-pass-2026")).access_token);
     expect(live).toBeTruthy();
   });
 
@@ -242,14 +249,14 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
 
     // Manager creates an engineer and a client-portal user in this workspace.
     const managerToken = tokenStore.get()!;
-    const eng = await usersApi.create({ email: `eng-${stamp}@example.com`, full_name: "Eng", password: "password123", role: "engineer" });
+    const eng = await usersApi.create({ email: `eng-${stamp}@example.com`, full_name: "Eng", password: "frontend-e2e-pass-2026", role: "engineer" });
     expect(eng.role).toBe("engineer");
-    const portal = await usersApi.create({ email: `portal-${stamp}@example.com`, full_name: "Portal", password: "password123", role: "client", client_id: second.id });
+    const portal = await usersApi.create({ email: `portal-${stamp}@example.com`, full_name: "Portal", password: "frontend-e2e-pass-2026", role: "client", client_id: second.id });
     expect(portal.client_id).toBe(second.id);
-    await expect(usersApi.create({ email: `x-${stamp}@example.com`, full_name: "X", password: "password123", role: "admin" })).rejects.toMatchObject({ status: 403 });
+    await expect(usersApi.create({ email: `x-${stamp}@example.com`, full_name: "X", password: "frontend-e2e-pass-2026", role: "admin" })).rejects.toMatchObject({ status: 403 });
 
     // Engineer: sees the manager's data and seller profile, cannot delete or record IRN.
-    const engTokens = await authApi.login(eng.email, "password123");
+    const engTokens = tokensFrom(await authApi.login(eng.email, "frontend-e2e-pass-2026"));
     tokenStore.set(engTokens.access_token);
     expect((await clientsApi.list()).length).toBe(2);
     expect((await usersApi.workspace()).gstin).toBe(SELLER_GSTIN); // manager's seller profile, for tax previews
@@ -258,7 +265,7 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
     // Own password change: the old password stops working, every earlier
     // session is revoked, and the returned pair keeps this caller signed in.
     const staleToken = engTokens.access_token;
-    const rotated = await usersApi.changePassword({ current_password: "password123", new_password: "engineer-new-pw1" });
+    const rotated = await usersApi.changePassword({ current_password: "frontend-e2e-pass-2026", new_password: "engineer-new-phrase-2026" });
     expect(rotated.access_token).not.toBe(staleToken);
     tokenStore.set(rotated.access_token);
     expect((await authApi.me()).email).toBe(eng.email);
@@ -270,15 +277,15 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
     const stale = await nativeFetch(`${BASE}/api/v1/auth/me`, { headers: { Authorization: `Bearer ${staleToken}` } });
     expect(stale.status).toBe(401);
 
-    await expect(authApi.login(eng.email, "password123")).rejects.toMatchObject({ status: 401 });
-    await authApi.login(eng.email, "engineer-new-pw1");
+    await expect(authApi.login(eng.email, "frontend-e2e-pass-2026")).rejects.toMatchObject({ status: 401 });
+    await authApi.login(eng.email, "engineer-new-phrase-2026");
 
     // Deleting a client that has invoices is a conflict, not a crash.
     tokenStore.set(managerToken);
     await expect(clientsApi.remove(clientId)).rejects.toMatchObject({ status: 409, code: "CONFLICT" });
 
     // Client-portal user: only its own client and invoices, read-only.
-    const portalTokens = await authApi.login(portal.email, "password123");
+    const portalTokens = tokensFrom(await authApi.login(portal.email, "frontend-e2e-pass-2026"));
     tokenStore.set(portalTokens.access_token);
     expect((await clientsApi.list()).map((c) => c.id)).toEqual([second.id]);
     const mine = await invoicesApi.list({});
@@ -302,7 +309,7 @@ describe.skipIf(!BASE)("frontend API layer against live backend", () => {
 
     // The bootstrap account is the platform admin on a fresh database.
     const mine = tokenStore.get()!;
-    const adminTokens = await authApi.login(`bootstrap-${stamp}@example.com`, "password123");
+    const adminTokens = tokensFrom(await authApi.login(`bootstrap-${stamp}@example.com`, "frontend-e2e-pass-2026"));
     tokenStore.set(adminTokens.access_token);
     try {
       const admin = await authApi.me();

@@ -1,6 +1,6 @@
 /** One function per backend route, grouped by resource. */
 
-import { api } from "./client";
+import { api, request } from "./client";
 import type {
   AuditEvent,
   Client,
@@ -16,7 +16,12 @@ import type {
   InvoiceUpdateRequest,
   IrnCancelRequest,
   IrnRecordRequest,
+  IrpCredentials,
+  IrpCredentialsInput,
   IrpStatus,
+  MfaChallenge,
+  MfaEnabled,
+  MfaSetup,
   IrpSubmissionResult,
   PasswordChangeRequest,
   OcrDocument,
@@ -38,8 +43,13 @@ const V1 = "/api/v1";
 export const authApi = {
   register: (email: string, full_name: string, password: string) =>
     api.post<User>(`${V1}/auth/register`, { email, full_name, password }),
+  /** A session, or — for an account with a second factor — a challenge to complete first. */
   login: (email: string, password: string) =>
-    api.post<TokenResponse>(`${V1}/auth/login`, { email, password }),
+    api.post<TokenResponse | MfaChallenge>(`${V1}/auth/login`, { email, password }),
+  mfaVerify: (mfa_token: string, code: string) => api.post<TokenResponse>(`${V1}/auth/mfa/verify`, { mfa_token, code }),
+  mfaSetup: () => api.post<MfaSetup>(`${V1}/auth/mfa/setup`),
+  mfaEnable: (code: string) => api.post<MfaEnabled>(`${V1}/auth/mfa/enable`, { code }),
+  mfaDisable: (code: string) => api.post<void>(`${V1}/auth/mfa/disable`, { code }),
   me: () => api.get<User>(`${V1}/auth/me`),
   /**
    * Renews the session. Sends no body: the refresh token is in the HttpOnly
@@ -101,6 +111,11 @@ export const invoicesApi = {
   cancelIrn: (id: number, body: IrnCancelRequest) => api.post<Invoice>(`${V1}/invoices/${id}/einvoice/cancel`, body),
   /** Which IRP backend this deployment files with, and whether it is live. */
   irpStatus: () => api.get<IrpStatus>(`${V1}/invoices/irp/status`),
+  /** The INV-01 exactly as filed — frozen at registration, unlike `einvoice`. */
+  filedEinvoice: (id: number) => api.get<EInvoicePayload>(`${V1}/invoices/${id}/einvoice/filed`),
+  irpCredentials: () => api.get<IrpCredentials>(`${V1}/invoices/irp/credentials`),
+  setIrpCredentials: (body: IrpCredentialsInput) => request<IrpCredentials>(`${V1}/invoices/irp/credentials`, { method: "PUT", body }),
+  removeIrpCredentials: () => api.delete(`${V1}/invoices/irp/credentials`),
 };
 
 export const gstApi = {

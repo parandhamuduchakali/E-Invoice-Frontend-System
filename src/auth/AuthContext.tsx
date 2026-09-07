@@ -15,7 +15,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { useQueryClient } from "@tanstack/react-query";
 import { authApi, usersApi } from "@/api/endpoints";
 import { refreshSession, tokenStore, workspaceStore } from "@/api/client";
-import type { User } from "@/api/types";
+import type { MfaChallenge, User } from "@/api/types";
 
 interface AuthState {
   user: User | null;
@@ -27,7 +27,13 @@ interface AuthState {
   seller: User | null;
   /** True until the refresh cookie has been checked against /auth/me. */
   loading: boolean;
-  login: (email: string, password: string) => Promise<void>;
+  /**
+   * Signs in. Resolves to null once the session is established, or to an
+   * MfaChallenge when the account has a second factor — pass it, with the
+   * user's code, to completeMfa.
+   */
+  login: (email: string, password: string) => Promise<MfaChallenge | null>;
+  completeMfa: (challenge: MfaChallenge, code: string) => Promise<void>;
   register: (email: string, fullName: string, password: string) => Promise<void>;
   logout: () => void;
   /** Re-fetch the current user (after profile edits). */
@@ -127,8 +133,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(
     async (email: string, password: string) => {
-      const token = await authApi.login(email, password);
+      const result = await authApi.login(email, password);
+      if ("mfa_required" in result) return result; // no session yet: the code comes next
       // The matching refresh token arrived as a cookie the browser stores for us.
+      tokenStore.set(result.access_token);
+      await refreshUser();
+      return null;
+    },
+    [refreshUser],
+  );
+
+  const completeMfa = useCallback(
+    async (challenge: MfaChallenge, code: string) => {
+      const token = await authApi.mfaVerify(challenge.mfa_token, code);
       tokenStore.set(token.access_token);
       await refreshUser();
     },
@@ -138,7 +155,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const register = useCallback(
     async (email: string, fullName: string, password: string) => {
       await authApi.register(email, fullName, password);
-      await login(email, password);
+      await login(email, password); // a brand-new account has no second factor
     },
     [login],
   );
@@ -163,8 +180,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo<AuthState>(
-    () => ({ user, seller, loading, login, register, logout, refreshUser, setUser: setUserAndSeller, workspace, setWorkspace }),
-    [user, seller, loading, login, register, logout, refreshUser, setUserAndSeller, workspace, setWorkspace],
+    () => ({ user, seller, loading, login, completeMfa, register, logout, refreshUser, setUser: setUserAndSeller, workspace, setWorkspace }),
+    [user, seller, loading, login, completeMfa, register, logout, refreshUser, setUserAndSeller, workspace, setWorkspace],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
