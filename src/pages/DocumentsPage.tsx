@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { clientsApi, documentsApi } from "@/api/endpoints";
-import type { ExtractedLineItem, StoredDocument, StoredDocumentSummary } from "@/api/types";
+import type { ExtractedLineItem, ExtractedParty, StoredDocument, StoredDocumentSummary } from "@/api/types";
 import { useAuth } from "@/auth/AuthContext";
 import { Card, ConfirmButton, EmptyState, ErrorBanner, Field, InfoBanner, Input, KeyValue, PageHeader, Select, Spinner } from "@/components/ui";
 import { displayDateTime, money } from "@/lib/format";
@@ -70,6 +70,30 @@ function rowWarnings(row: ExtractedLineItem): string[] {
   }
   if (!row.description.trim()) kept.push("Description is empty.");
   return kept;
+}
+
+/** One party as the extractor read it, or a single line saying it read nothing. */
+function PartyCard({ title, party }: { title: string; party: ExtractedParty }) {
+  const filled = Object.values(party).some((v) => v !== null);
+  return (
+    <div>
+      <h4 style={{ margin: "0 0 0.35rem" }}>{title}</h4>
+      {!filled ? (
+        <p className="muted small" style={{ margin: 0 }}>Nothing read for this party.</p>
+      ) : (
+        <KeyValue
+          items={[
+            ["Name", party.legal_name ?? "—"],
+            ["GSTIN", party.gstin ? <code key="g">{party.gstin}</code> : "—"],
+            ["Address", party.address ?? "—"],
+            ["Place", party.place ?? "—"],
+            ["State", party.state_code ? `${party.state ?? ""} (${party.state_code})`.trim() : (party.state ?? "—")],
+            ["PIN", party.pincode ?? "—"],
+          ]}
+        />
+      )}
+    </div>
+  );
 }
 
 export function DocumentsPage() {
@@ -400,6 +424,81 @@ export function DocumentsPage() {
                   )}
                 </div>
               )}
+
+              {selected.data!.extracted_fields?.structured && (() => {
+                const s = selected.data!.extracted_fields!.structured;
+                return (
+                  <div style={{ marginTop: "1.25rem" }}>
+                    <h4 style={{ margin: "0 0 0.25rem" }}>Who is who on this document</h4>
+                    <p className="muted small" style={{ marginTop: 0 }}>
+                      Each value is attributed to a party from where it sits on the page. A GSTIN in the
+                      wrong column files the invoice against the wrong taxpayer, so check these before creating one.
+                    </p>
+                    {s.warnings.length > 0 && (
+                      <InfoBanner tone="warn">
+                        <div>
+                          {s.warnings.map((w) => (
+                            <div key={w}>⚠ {w}</div>
+                          ))}
+                        </div>
+                      </InfoBanner>
+                    )}
+                    <div className="grid three">
+                      <PartyCard title="Supplier" party={s.supplier} />
+                      <PartyCard title="Bill to" party={s.recipient} />
+                      <PartyCard title="Ship to" party={s.shipping} />
+                    </div>
+                    <div className="grid two" style={{ marginTop: "0.75rem" }}>
+                      <KeyValue
+                        items={[
+                          ["Document", s.document.document_type_label ?? s.document.document_type ?? "—"],
+                          ["Number", s.document.document_number ?? "—"],
+                          ["Date", s.document.document_date ?? "—"],
+                          ["Supply type", s.document.supply_type ?? "—"],
+                          ["Place of supply", s.document.place_of_supply_code ? `${s.document.place_of_supply ?? ""} (${s.document.place_of_supply_code})`.trim() : "—"],
+                          ["IRN", s.document.irn ? <code key="irn" className="small">{s.document.irn.slice(0, 16)}…</code> : "—"],
+                        ]}
+                      />
+                      <KeyValue
+                        items={[
+                          ["Taxable value", s.totals.assessable_value !== null ? money(s.totals.assessable_value) : "—"],
+                          ["IGST", s.totals.igst_value !== null ? money(s.totals.igst_value) : "—"],
+                          ["CGST", s.totals.cgst_value !== null ? money(s.totals.cgst_value) : "—"],
+                          ["SGST", s.totals.sgst_value !== null ? money(s.totals.sgst_value) : "—"],
+                          ["Invoice total", s.totals.total_invoice_value !== null ? money(s.totals.total_invoice_value) : "—"],
+                        ]}
+                      />
+                    </div>
+                    {s.evidence.length > 0 && (
+                      <details style={{ marginTop: "0.75rem" }}>
+                        <summary>How each value was found ({s.evidence.length})</summary>
+                        <div className="table-wrap">
+                          <table>
+                            <thead>
+                              <tr><th>Field</th><th>Value</th><th>Matched label</th><th>Method</th><th className="num">Confidence</th></tr>
+                            </thead>
+                            <tbody>
+                              {s.evidence.map((e) => (
+                                <tr key={`${e.section}-${e.field_name}`}>
+                                  <td><span className="muted small">{e.section} · </span>{e.field_name.replace(/_/g, " ")}</td>
+                                  <td>{String(e.value)}</td>
+                                  <td>{e.matched_label ?? <span className="muted">—</span>}</td>
+                                  <td><span className="pill">{e.method}</span></td>
+                                  <td className="num">{e.confidence.toFixed(2)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <p className="muted small">
+                          Confidence ranks how the value was found — read off a label, inferred from position, or a
+                          fuzzy match — so you know where to look first. It is not a probability of being right.
+                        </p>
+                      </details>
+                    )}
+                  </div>
+                );
+              })()}
 
               {selected.data!.full_text && (
                 <details style={{ marginTop: "1rem" }}>

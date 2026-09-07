@@ -6,6 +6,7 @@ import { clientsApi, invoicesApi } from "@/api/endpoints";
 import type { InvoiceStatus, IrnCancelRequest, IrnRecordRequest } from "@/api/types";
 import { useAuth } from "@/auth/AuthContext";
 import { InvoicePreview } from "@/components/InvoicePreview";
+import { QrCode } from "@/components/QrCode";
 import { DownloadIcon, PrintIcon } from "@/components/icons";
 import { useStateName } from "@/components/StateCodeSelect";
 import { Card, ConfirmButton, ErrorBanner, Field, InfoBanner, Input, KeyValue, PageHeader, Select, Spinner, StatusBadge, Textarea } from "@/components/ui";
@@ -54,6 +55,22 @@ export function InvoiceDetailPage() {
 
   function copyPayload() {
     if (payload) void navigator.clipboard?.writeText(payload);
+  }
+
+  const [filedBusy, setFiledBusy] = useState(false);
+  async function downloadFiled() {
+    setFiledBusy(true);
+    try {
+      const filed = await invoicesApi.filedEinvoice(invoiceId);
+      const url = URL.createObjectURL(new Blob([JSON.stringify(filed, null, 2)], { type: "application/json" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${inv.invoice_number}-filed-einvoice.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } finally {
+      setFiledBusy(false);
+    }
   }
 
   function downloadPayload() {
@@ -315,7 +332,27 @@ export function InvoiceDetailPage() {
 
       {inv.irn && inv.signed_qr_code && (
         <Card title="Signed QR code" className="no-print">
-          <code className="qr small">{inv.signed_qr_code}</code>
+          <div className="row" style={{ alignItems: "flex-start", gap: "1.25rem" }}>
+            <QrCode value={inv.signed_qr_code} size={176} alt={`IRP signed QR code for IRN ${inv.irn}`} />
+            <div>
+              <p className="muted small" style={{ marginTop: 0 }}>
+                This image is printed on the invoice, as the GST rules require. The text is the signed JWT it encodes.
+              </p>
+              <code className="qr small">{inv.signed_qr_code}</code>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {inv.irn && (
+        <Card title="Filed document" className="no-print">
+          <p className="muted small" style={{ marginTop: 0 }}>
+            The INV-01 exactly as it was filed, frozen at registration. The client and seller records it was built
+            from can change later; this cannot.
+          </p>
+          <button type="button" className="btn" onClick={downloadFiled} disabled={filedBusy}>
+            <DownloadIcon size={16} /> {filedBusy ? "Fetching…" : "Download filed INV-01 JSON"}
+          </button>
         </Card>
       )}
     </>

@@ -5,6 +5,49 @@
 
 // ── Auth / users ───────────────────────────────────────────────────────────
 
+/** Returned by POST /auth/login for an account with a second factor: no session yet. */
+export interface MfaChallenge {
+  mfa_required: true;
+  /** Short-lived proof the password step passed; opens nothing but /auth/mfa/verify. */
+  mfa_token: string;
+  expires_in: number;
+}
+
+export interface MfaSetup {
+  secret: string;
+  /** Render as a QR code for the authenticator app. */
+  otpauth_url: string;
+}
+
+export interface MfaEnabled {
+  /** Shown once; stored only as hashes. */
+  recovery_codes: string[];
+}
+
+/** A workspace's own IRP login (secrets masked on read). */
+export interface IrpCredentials {
+  configured: boolean;
+  decryptable: boolean;
+  base_url: string | null;
+  client_id: string | null;
+  client_secret_masked: string | null;
+  username: string | null;
+  password_masked: string | null;
+  gstin: string | null;
+  public_key_present: boolean;
+  updated_at: string | null;
+}
+
+export interface IrpCredentialsInput {
+  base_url: string;
+  client_id: string;
+  client_secret: string;
+  username: string;
+  password: string;
+  gstin: string;
+  public_key_pem: string;
+}
+
 export interface TokenResponse {
   access_token: string;
   token_type: string;
@@ -64,6 +107,7 @@ export interface User {
   /** For client-portal users: the client record they represent. */
   client_id: number | null;
   created_at: string;
+  mfa_enabled: boolean;
   // GST seller profile (SellerDtls)
   legal_name: string | null;
   trade_name: string | null;
@@ -489,6 +533,8 @@ export interface IrpStatus {
   live: boolean;
   base_url: string;
   gstin: string;
+  /** True when this workspace files through its own stored credentials. */
+  workspace_credentials: boolean;
   cancel_window_hours: number;
   /** Reason code to label, for the cancellation form. */
   cancel_reasons: Record<string, string>;

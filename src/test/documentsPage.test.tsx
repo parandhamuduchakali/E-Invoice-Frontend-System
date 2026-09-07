@@ -185,6 +185,34 @@ describe("documents detail panel", () => {
     expect(options.state.draft.line_items[0].description).toBe("Office chair");
   });
 
+  it("shows who is who, and the cross-field warnings, from the structured extraction", async () => {
+    const doc = storedDocument();
+    doc.extracted_fields!.structured = {
+      ...emptyStructured(),
+      supplier: { ...emptyStructured().supplier, legal_name: "Acme Supplies", gstin: "27AAPFU0939F1ZV", state_code: "27", pincode: "400001" },
+      recipient: { ...emptyStructured().recipient, legal_name: "Bharat Traders LLP", gstin: "29AAACR5055K1Z3", state_code: "29" },
+      document: { ...emptyStructured().document, document_number: "INV-77", document_date: "2026-09-01", supply_type: "B2B" },
+      warnings: ["Taxable value plus tax comes to 1180.0, but the invoice total reads 5000.0."],
+      evidence: [
+        { field_name: "document_number", value: "INV-77", matched_label: "Invoice No", method: "label", confidence: 0.95, section: "document" },
+      ],
+    };
+    documentsGet.mockResolvedValue(doc);
+    renderPage();
+
+    expect(await screen.findByText("Acme Supplies")).toBeInTheDocument();
+    expect(screen.getByText("27AAPFU0939F1ZV")).toBeInTheDocument();
+    expect(screen.getByText("Bharat Traders LLP")).toBeInTheDocument();
+    // A party the extractor read nothing for says so rather than showing dashes.
+    expect(screen.getByText("Nothing read for this party.")).toBeInTheDocument();
+    // The arithmetic warning is surfaced, not buried.
+    expect(screen.getByText(/invoice total reads 5000/)).toBeInTheDocument();
+
+    // Evidence is there on demand, with the label that matched.
+    await userEvent.click(screen.getByText(/How each value was found/));
+    expect(screen.getByText("Invoice No")).toBeInTheDocument();
+  });
+
   it("offers a hand-entered table when OCR found no rows at all", async () => {
     documentsGet.mockResolvedValue(storedDocument([]));
     renderPage();

@@ -1,3 +1,5 @@
+import { IrpCredentialsCard } from "@/components/IrpCredentialsCard";
+import { MfaCard } from "@/components/MfaCard";
 import { useMutation } from "@tanstack/react-query";
 import { useEffect, useState, type FormEvent } from "react";
 import { usersApi } from "@/api/endpoints";
@@ -32,6 +34,7 @@ const REQUIRED_FOR_IRP: (keyof Form)[] = ["gstin", "legal_name", "address1", "lo
 
 export function SellerProfilePage() {
   const { user, setUser } = useAuth();
+  const isOwner = isWorkspaceOwner(user);
   const [form, setForm] = useState<Form | null>(user ? fromUser(user) : null);
   const [saved, setSaved] = useState(false);
 
@@ -153,6 +156,8 @@ export function SellerProfilePage() {
       </form>
 
       <PasswordCard />
+      <MfaCard />
+      {isOwner && can(user, "seller_profile:write") && <IrpCredentialsCard sellerGstin={user?.gstin ?? null} />}
     </>
   );
 }

@@ -7,6 +7,7 @@
 import type { ReactNode } from "react";
 import type { Client, Invoice, User } from "@/api/types";
 import { displayDate, money, percent, titleCase } from "@/lib/format";
+import { QrCode } from "@/components/QrCode";
 import { BuildingIcon } from "./icons";
 
 interface Props {
@@ -76,7 +77,19 @@ export function InvoicePreview({ invoice: inv, client, seller, actions }: Props)
           <span className="label">Balance due</span>
           <strong className="paper-balance">{money(balance)}</strong>
           <div className="muted small">Due date : {displayDate(inv.due_date)}</div>
-          {inv.irn && <div className="muted small">IRN <code className="qr">{inv.irn.slice(0, 16)}…</code></div>}
+          {inv.irn && (
+            <div className="irp-block">
+              {inv.signed_qr_code && (
+                // The GST rules require the IRP's signed QR *as an image* on the
+                // printed invoice; the JWT text alone does not satisfy them.
+                <QrCode value={inv.signed_qr_code} size={112} alt={`IRP signed QR code for IRN ${inv.irn}`} className="irp-qr" />
+              )}
+              <div className="muted small">
+                IRN <code className="qr">{inv.irn}</code>
+                {inv.ack_no && <><br />Ack {inv.ack_no} · {inv.ack_date}</>}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
