@@ -1,6 +1,6 @@
 /** Shared builders for test fixtures that mirror backend response shapes. */
 
-import type { ExtractedParty, StructuredInvoice } from "@/api/types";
+import type { DocumentClassification, ExtractedParty, StructuredInvoice } from "@/api/types";
 
 const emptyParty = (): ExtractedParty => ({
   legal_name: null,
@@ -52,4 +52,16 @@ export const emptyStructured = (): StructuredInvoice => ({
   },
   warnings: [],
   evidence: [],
+});
+
+/** A scan the classifier is sure is a tax invoice — the case most tests are about. */
+export const invoiceClassification = (over: Partial<DocumentClassification> = {}): DocumentClassification => ({
+  kind: "tax_invoice",
+  label: "Tax invoice",
+  confidence: 0.92,
+  invoice_like: true,
+  document_type: "INV",
+  evidence: ["title: TAX INVOICE", "structure: 2 GSTINs, tax totals"],
+  runner_up: null,
+  ...over,
 });

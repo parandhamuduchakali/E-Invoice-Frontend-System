@@ -61,5 +61,47 @@ export const GST_RATE_OPTIONS = [0, 0.1, 0.25, 1, 1.5, 3, 5, 7.5, 12, 18, 28];
 /** Frequently used Unit Quantity Codes for the item `unit` field. */
 export const UQC_OPTIONS = ["NOS", "PCS", "KGS", "GMS", "LTR", "MTR", "SQM", "BOX", "SET", "HRS", "OTH"];
 
+/** Words suppliers print for a unit, mapped to the code the portal accepts. */
+const UQC_SYNONYMS: Record<string, string> = {
+  NO: "NOS", NOS: "NOS", NUMBER: "NOS", NUMBERS: "NOS", UNIT: "NOS", UNITS: "NOS", EA: "NOS", EACH: "NOS",
+  PC: "PCS", PCS: "PCS", PIECE: "PCS", PIECES: "PCS",
+  KG: "KGS", KGS: "KGS", KILOGRAM: "KGS", KILOGRAMS: "KGS",
+  GM: "GMS", GMS: "GMS", GRAM: "GMS", GRAMS: "GMS", G: "GMS",
+  L: "LTR", LT: "LTR", LTR: "LTR", LITRE: "LTR", LITRES: "LTR", LITER: "LTR", LITERS: "LTR",
+  M: "MTR", MTR: "MTR", METRE: "MTR", METRES: "MTR", METER: "MTR", METERS: "MTR",
+  SQM: "SQM", SQMTR: "SQM", SQFT: "OTH",
+  BOX: "BOX", BOXES: "BOX", BX: "BOX",
+  SET: "SET", SETS: "SET",
+  HR: "HRS", HRS: "HRS", HOUR: "HRS", HOURS: "HRS",
+};
+
+/**
+ * A unit code the invoice form's list actually contains.
+ *
+ * OCR reads whatever the supplier printed ("Pieces", "Nos.", "kg"). Feeding
+ * that straight into a `<select>` shows the first option while the form holds
+ * the raw string, so the invoice is saved with a unit nobody chose. Anything
+ * unrecognised becomes OTH, which is what the portal expects for it.
+ */
+export function toUqc(value: string | null | undefined): string {
+  if (!value) return "NOS";
+  const key = value.toUpperCase().replace(/[^A-Z]/g, "");
+  if (UQC_OPTIONS.includes(key)) return key;
+  return UQC_SYNONYMS[key] ?? "OTH";
+}
+
+/**
+ * A GST percentage the form offers, or null when it is not one.
+ *
+ * Rates are snapped to the nearest slab within a small tolerance so an OCR
+ * misread of "18.00" survives, but an arbitrary number does not silently
+ * become a rate the government does not levy.
+ */
+export function toGstRate(value: number | null | undefined): number | null {
+  if (value === null || value === undefined || Number.isNaN(value)) return null;
+  const match = GST_RATE_OPTIONS.find((slab) => Math.abs(slab - value) <= 0.05);
+  return match ?? null;
+}
+
 export const EXPORT_SUPPLY_TYPES = new Set(["EXPWP", "EXPWOP"]);
 export const IGST_ONLY_SUPPLY_TYPES = new Set(["SEZWP", "SEZWOP", "EXPWP", "EXPWOP"]);

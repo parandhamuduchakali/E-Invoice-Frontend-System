@@ -22,6 +22,10 @@ export interface MfaSetup {
 export interface MfaEnabled {
   /** Shown once; stored only as hashes. */
   recovery_codes: string[];
+  /** Replacement access token: enabling MFA revokes every earlier session. */
+  access_token: string;
+  token_type: string;
+  expires_in: number;
 }
 
 /** A workspace's own IRP login (secrets masked on read). */
@@ -490,6 +494,34 @@ export interface StructuredInvoice {
   evidence: ExtractedFieldEvidence[];
 }
 
+/** Kind of document a scan was recognised as, decided before its fields are read. */
+export type DocumentKind =
+  | "tax_invoice"
+  | "credit_note"
+  | "debit_note"
+  | "bill_of_supply"
+  | "proforma_invoice"
+  | "purchase_order"
+  | "delivery_challan"
+  | "receipt"
+  | "eway_bill"
+  | "other";
+
+export interface DocumentClassification {
+  kind: DocumentKind;
+  label: string;
+  /** 0–1, ordinal: a clear title match ranks above a body-cue guess. */
+  confidence: number;
+  /** Whether an invoice record can be created from this document at all. */
+  invoice_like: boolean;
+  /** INV / CRN / DBN when invoice-like, else null. */
+  document_type: DocumentType | null;
+  /** The cues that fired: `title:`, `body:`, `mentions:`, `structure:`. */
+  evidence: string[];
+  /** Second-placed kind when the call was close. */
+  runner_up: DocumentKind | null;
+}
+
 export interface ExtractedInvoiceFields {
   gstins: string[];
   invalid_gstins: string[];
@@ -510,6 +542,12 @@ export interface ExtractedInvoiceFields {
   key_values: Record<string, string[]>;
   /** Role-assigned view of the same document; prefer this when building an invoice. */
   structured: StructuredInvoice;
+  /** What the document is. Read first: a purchase order yields plausible invoice fields too. */
+  classification: DocumentClassification;
+  /** "rules" or "ai" — which pipeline produced these fields. */
+  extraction_method: string;
+  /** Messages for the reviewer: dropped model values, an AI→rules fallback, charges the form cannot hold. */
+  extraction_notes: string[];
 }
 
 export interface OcrDocument {
@@ -553,6 +591,24 @@ export interface IrnCancelRequest {
   remarks: string;
 }
 
+/** Which extraction pipeline to run: OCR + rules, or Azure Vision + Azure OpenAI. */
+export type PipelineName = "rules" | "ai";
+
+export interface PipelineInfo {
+  name: PipelineName;
+  label: string;
+  available: boolean;
+  /** Why it cannot run here, when it cannot. */
+  reason: string;
+  /** OCR backend: paddleocr, llamaparse or azure-vision. */
+  ocr: string;
+  /** "rules" or "azure-openai:<deployment>". */
+  extractor: string;
+  /** The document or its text is sent to a third party — say so before the user picks it. */
+  data_leaves_server: boolean;
+  description: string;
+}
+
 export interface OcrStatus {
   available: boolean;
   engine: string;
@@ -561,6 +617,8 @@ export interface OcrStatus {
   dpi: number;
   max_file_mb: number;
   max_pages: number;
+  default_pipeline: string;
+  pipelines: PipelineInfo[];
 }
 
 // Type alias (not interface) so it is assignable to the client's query record.
@@ -571,6 +629,8 @@ export type OcrExtractOptions = {
   binarize?: boolean;
   use_text_layer?: boolean;
   dpi?: number;
+  /** Omit for the server default. */
+  pipeline?: PipelineName;
 };
 
 

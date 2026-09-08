@@ -13,23 +13,35 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Client, ExtractedLineItem, StoredDocument, User } from "@/api/types";
-import { emptyStructured } from "./fixtures";
+import { emptyStructured, invoiceClassification } from "./fixtures";
 
 const documentsGet = vi.fn();
 const documentsList = vi.fn();
 const clientsList = vi.fn();
+const ocrStatus = vi.fn();
+const documentsRetry = vi.fn();
 const navigate = vi.fn();
 
 vi.mock("@/api/endpoints", () => ({
   documentsApi: {
     list: () => documentsList(),
     get: (id: number) => documentsGet(id),
-    retry: vi.fn(),
+    retry: (id: number, pipeline?: string) => documentsRetry(id, pipeline),
     remove: vi.fn(),
     file: vi.fn(),
   },
   clientsApi: { list: () => clientsList() },
+  ocrApi: { status: () => ocrStatus() },
 }));
+
+const STATUS = {
+  available: true, engine: "paddleocr", profile: "fast", lang: "en", dpi: 200, max_file_mb: 20, max_pages: 20,
+  default_pipeline: "rules",
+  pipelines: [
+    { name: "rules", label: "Rule-based", available: true, reason: "", ocr: "paddleocr", extractor: "rules", data_leaves_server: false, description: "" },
+    { name: "ai", label: "AI (Azure)", available: false, reason: "Azure OpenAI is not configured.", ocr: "azure-vision", extractor: "azure-openai", data_leaves_server: true, description: "" },
+  ],
+};
 
 vi.mock("react-router-dom", async () => {
   const actual = await vi.importActual<typeof import("react-router-dom")>("react-router-dom");
@@ -93,6 +105,9 @@ function storedDocument(rows: ExtractedLineItem[] = [SCANNED_ROW]): StoredDocume
       line_items: rows,
       key_values: {},
       structured: emptyStructured(),
+      classification: invoiceClassification(),
+      extraction_method: "rules",
+      extraction_notes: [],
     },
   };
 }
@@ -119,6 +134,9 @@ describe("documents detail panel", () => {
     documentsList.mockResolvedValue([]);
     clientsList.mockResolvedValue(CLIENTS);
     documentsGet.mockResolvedValue(storedDocument());
+    ocrStatus.mockResolvedValue(STATUS);
+    documentsRetry.mockReset();
+    documentsRetry.mockResolvedValue({});
   });
 
   it("shows the extracted item table and its warning", async () => {
@@ -220,5 +238,67 @@ describe("documents detail panel", () => {
     expect(await screen.findByText(/No item table could be read/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Add row" }));
     expect(within(screen.getByRole("table")).getAllByRole("row")).toHaveLength(2); // header + one row
+  });
+
+  it("says what the document is, and warns before a non-invoice becomes a draft", async () => {
+    const doc = storedDocument();
+    doc.extracted_fields!.classification = invoiceClassification({
+      kind: "purchase_order", label: "Purchase order", confidence: 0.85, invoice_like: false, document_type: null,
+      evidence: ["title: PURCHASE ORDER", "body: PO No"],
+    });
+    documentsGet.mockResolvedValue(doc);
+    renderPage();
+
+    expect(await screen.findByText(/looks like a purchase order, not a tax invoice/)).toBeInTheDocument();
+    expect(screen.getByText(/Purchase order \(85% sure\)/)).toBeInTheDocument();
+    expect(screen.getByText(/Why: title: PURCHASE ORDER; body: PO No/)).toBeInTheDocument();
+    // The button is still there — the reviewer may know better — but it no longer reads as the obvious next step.
+    expect(screen.getByRole("button", { name: "Create invoice anyway" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create invoice from this" })).not.toBeInTheDocument();
+  });
+
+  it("routes a credit note to the CRN path", async () => {
+    const doc = storedDocument();
+    doc.extracted_fields!.classification = invoiceClassification({ kind: "credit_note", label: "Credit note", document_type: "CRN" });
+    documentsGet.mockResolvedValue(doc);
+    renderPage();
+
+    expect(await screen.findByText(/Recognised as a credit note/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Create credit note from this" }));
+    const [, options] = navigate.mock.calls[0];
+    expect(options.state.draft.document_type).toBe("CRN");
+  });
+
+  it("shows no banner for a confident tax invoice", async () => {
+    renderPage();
+    await screen.findByText(/Item table \(1 row\)/);
+    expect(screen.getByText(/Tax invoice \(92% sure\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/Recognised as a/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/not a tax invoice/)).not.toBeInTheDocument();
+  });
+
+  it("offers a re-run with AI only when the server can run that pipeline, and sends the choice", async () => {
+    const doc = storedDocument();
+    documentsList.mockResolvedValue([{ ...doc, extracted_fields: undefined }]);
+    renderPage();
+    expect(await screen.findByRole("button", { name: "Re-run OCR" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Re-run with AI" })).not.toBeInTheDocument();
+
+    const status = { ...STATUS, pipelines: STATUS.pipelines.map((p) => ({ ...p, available: true })) };
+    ocrStatus.mockResolvedValue(status);
+    renderPage();
+    const ai = await screen.findByRole("button", { name: "Re-run with AI" });
+    await userEvent.click(ai);
+    expect(documentsRetry).toHaveBeenCalledWith(1, "ai");
+  });
+
+  it("shows which pipeline produced the fields and what it wants the reviewer to know", async () => {
+    const doc = storedDocument();
+    doc.extracted_fields!.extraction_method = "ai";
+    doc.extracted_fields!.extraction_notes = ["Dropped recipient gstin '29AAACR5055K1Z3': not found in the recognised text."];
+    documentsGet.mockResolvedValue(doc);
+    renderPage();
+    expect(await screen.findByText(/AI \(Azure OpenAI\), grounded against the OCR text/)).toBeInTheDocument();
+    expect(screen.getByText(/Dropped recipient gstin/)).toBeInTheDocument();
   });
 });

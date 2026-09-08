@@ -18,6 +18,7 @@ import type {
   AuditEvent,
   Client,
   ExtractedDocumentDetails,
+  DocumentClassification,
   ExtractedFieldEvidence,
   ExtractedInvoiceFields,
   ExtractedLineItem,
@@ -37,6 +38,8 @@ import type {
   PaginatedAuditEvents,
   PaginatedInvoices,
   StoredDocument,
+  OcrStatus,
+  PipelineInfo,
   StructuredInvoice,
   TokenResponse,
   User,
@@ -67,6 +70,9 @@ const party: SameKeys<ExtractedParty, Schemas["PartyDetailsResponse"]> = true;
 const documentDetails: SameKeys<ExtractedDocumentDetails, Schemas["DocumentDetailsResponse"]> = true;
 const totals: SameKeys<ExtractedTaxTotals, Schemas["TaxTotalsResponse"]> = true;
 const evidence: SameKeys<ExtractedFieldEvidence, Schemas["FieldEvidenceResponse"]> = true;
+const classification: SameKeys<DocumentClassification, Schemas["DocumentClassificationResponse"]> = true;
+const ocrStatus: SameKeys<OcrStatus, Schemas["OcrStatusResponse"]> = true;
+const pipelineInfo: SameKeys<PipelineInfo, Schemas["PipelineInfoResponse"]> = true;
 const auditEvent: SameKeys<AuditEvent, Schemas["AuditEventResponse"]> = true;
 const paginatedAudit: SameKeys<PaginatedAuditEvents, Schemas["PaginatedAuditEvents"]> = true;
 const irpStatus: SameKeys<IrpStatus, Schemas["IrpStatusResponse"]> = true;
@@ -82,6 +88,7 @@ const irpCredentialsInput: SameKeys<IrpCredentialsInput, Schemas["IrpCredentials
 // Referenced so the compiler does not report them as unused.
 export const CONTRACT_CHECKS = [
   invoice, lineItem, paginatedInvoices, client, user, token, storedDocument, extractedFields,
-  extractedLineItem, structured, party, documentDetails, totals, evidence, auditEvent, paginatedAudit,
+  extractedLineItem, structured, party, documentDetails, totals, evidence, classification, ocrStatus, pipelineInfo,
+  auditEvent, paginatedAudit,
   irpStatus, irpSubmission, irnRecord, irnCancel, mfaChallenge, mfaSetup, mfaEnabled, irpCredentials, irpCredentialsInput,
 ] as const;

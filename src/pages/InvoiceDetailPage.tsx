@@ -58,8 +58,10 @@ export function InvoiceDetailPage() {
   }
 
   const [filedBusy, setFiledBusy] = useState(false);
+  const [filedError, setFiledError] = useState<unknown>(null);
   async function downloadFiled() {
     setFiledBusy(true);
+    setFiledError(null);
     try {
       const filed = await invoicesApi.filedEinvoice(invoiceId);
       const url = URL.createObjectURL(new Blob([JSON.stringify(filed, null, 2)], { type: "application/json" }));
@@ -68,6 +70,10 @@ export function InvoiceDetailPage() {
       a.download = `${inv.invoice_number}-filed-einvoice.json`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (error) {
+      // An IRN recorded by hand has no filed payload to serve; the 404 has to
+      // reach the user rather than becoming an unhandled rejection.
+      setFiledError(error);
     } finally {
       setFiledBusy(false);
     }
@@ -214,7 +220,7 @@ export function InvoiceDetailPage() {
               </div>
             </InfoBanner>
           )}
-          <ErrorBanner error={generate.error} onDismiss={() => generate.reset()} />
+          <ErrorBanner error={generate.error ?? filedError} onDismiss={() => { generate.reset(); setFiledError(null); }} />
 
           {payload && (
             <>

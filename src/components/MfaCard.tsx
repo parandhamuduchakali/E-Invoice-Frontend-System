@@ -9,6 +9,7 @@
 
 import { useMutation } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
+import { tokenStore } from "@/api/client";
 import { authApi } from "@/api/endpoints";
 import type { MfaSetup } from "@/api/types";
 import { useAuth } from "@/auth/AuthContext";
@@ -24,7 +25,16 @@ export function MfaCard() {
   const begin = useMutation({ mutationFn: authApi.mfaSetup, onSuccess: (s) => { setSetup(s); setCode(""); } });
   const enable = useMutation({
     mutationFn: (c: string) => authApi.mfaEnable(c),
-    onSuccess: async (r) => { setRecoveryCodes(r.recovery_codes); setSetup(null); setCode(""); await refreshUser(); },
+    onSuccess: async (r) => {
+      // Turning the second factor on revokes every session opened before it,
+      // this one included. The server issues a replacement pair; without
+      // adopting the access token here the very next request would 401.
+      tokenStore.set(r.access_token);
+      setRecoveryCodes(r.recovery_codes);
+      setSetup(null);
+      setCode("");
+      await refreshUser();
+    },
   });
   const disable = useMutation({
     mutationFn: (c: string) => authApi.mfaDisable(c),

@@ -8,8 +8,8 @@ import type {
   DashboardStats,
   EInvoicePayload,
   EInvoiceReadiness,
-  GstStateCode,
   GstinValidation,
+  GstStateCode,
   Invoice,
   InvoiceCreateRequest,
   InvoiceStatus,
@@ -19,16 +19,17 @@ import type {
   IrpCredentials,
   IrpCredentialsInput,
   IrpStatus,
+  IrpSubmissionResult,
   MfaChallenge,
   MfaEnabled,
   MfaSetup,
-  IrpSubmissionResult,
-  PasswordChangeRequest,
   OcrDocument,
   OcrExtractOptions,
   OcrStatus,
   PaginatedAuditEvents,
   PaginatedInvoices,
+  PasswordChangeRequest,
+  PipelineName,
   StoredDocument,
   StoredDocumentSummary,
   TokenResponse,
@@ -139,7 +140,14 @@ export const documentsApi = {
   get: (id: number) => api.get<StoredDocument>(`${V1}/documents/${id}`),
   /** Original upload as a Blob (needs the auth header, so not a plain link). */
   file: (id: number) => api.blob(`${V1}/documents/${id}/file`),
-  retry: (id: number) => api.post<OcrDocument>(`${V1}/documents/${id}/retry`),
+  /**
+   * Queues the stored file to be read again; `pipeline` picks rules or AI.
+   *
+   * Answers 202 with the document in `pending`, like the upload does — the read
+   * itself happens in the background. Poll `get(id)` for the result.
+   */
+  retry: (id: number, pipeline?: PipelineName) =>
+    api.post<StoredDocument>(`${V1}/documents/${id}/retry`, undefined, pipeline ? { pipeline } : undefined),
   remove: (id: number) => api.delete(`${V1}/documents/${id}`),
 };
 

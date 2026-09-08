@@ -17,7 +17,7 @@ import { useAuth } from "@/auth/AuthContext";
 import { StateCodeSelect } from "@/components/StateCodeSelect";
 import { Card, Checkbox, ErrorBanner, Field, InfoBanner, Input, PageHeader, Select, Spinner, Textarea } from "@/components/ui";
 import { addDaysIso, money, todayIso } from "@/lib/format";
-import { EXPORT_SUPPLY_TYPES, GST_RATE_OPTIONS, UQC_OPTIONS, isValidHsn } from "@/lib/gst";
+import { EXPORT_SUPPLY_TYPES, GST_RATE_OPTIONS, UQC_OPTIONS, isValidHsn, toGstRate, toUqc } from "@/lib/gst";
 import { computeTotals, isIntraState } from "@/lib/invoiceMath";
 
 type LineDraft = LineItemInput & { key: string };
@@ -145,15 +145,29 @@ export function InvoiceFormPage() {
     return {
       ...EMPTY_FORM,
       client_id: preselectedClient,
+      document_type: d.document_type ?? EMPTY_FORM.document_type,
+      preceding_invoice_number: d.preceding_invoice_number ?? "",
+      preceding_invoice_date: d.preceding_invoice_date ?? "",
       issue_date: d.issue_date ?? EMPTY_FORM.issue_date,
       due_date: d.due_date ?? EMPTY_FORM.due_date,
       place_of_supply: d.place_of_supply ?? "",
       reverse_charge: d.reverse_charge ?? false,
-      tax_rate: d.tax_rate ?? EMPTY_FORM.tax_rate,
+      // toGstRate/toUqc again here, not because the mapper skips them, but
+      // because a draft can also arrive from a future caller: a value outside
+      // these lists renders as the first option while the form submits the
+      // original, which is the quietest possible way to file a wrong invoice.
+      tax_rate: toGstRate(d.tax_rate) ?? EMPTY_FORM.tax_rate,
       notes: d.notes ?? "",
       source_reference: d.source_reference ?? "",
       document_id: d.document_id ?? null,
-      line_items: d.line_items?.length ? d.line_items.map((li) => ({ ...newLine(), ...li, hsn_code: li.hsn_code ?? "", unit: li.unit ?? "NOS" })) : [newLine()],
+      line_items: d.line_items?.length
+        ? d.line_items.map((li) => ({
+            ...newLine(), ...li,
+            hsn_code: li.hsn_code ?? "",
+            unit: toUqc(li.unit),
+            gst_rate: toGstRate(li.gst_rate ?? null),
+          }))
+        : [newLine()],
     };
   });
 

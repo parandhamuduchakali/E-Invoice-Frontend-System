@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { clientsApi, documentsApi } from "@/api/endpoints";
-import type { ExtractedLineItem, ExtractedParty, StoredDocument, StoredDocumentSummary } from "@/api/types";
+import { clientsApi, documentsApi, ocrApi } from "@/api/endpoints";
+import type { DocumentClassification, ExtractedLineItem, ExtractedParty, PipelineName, StoredDocument, StoredDocumentSummary } from "@/api/types";
 import { useAuth } from "@/auth/AuthContext";
 import { Card, ConfirmButton, EmptyState, ErrorBanner, Field, InfoBanner, Input, KeyValue, PageHeader, Select, Spinner } from "@/components/ui";
 import { displayDateTime, money } from "@/lib/format";
@@ -105,11 +105,33 @@ export function DocumentsPage() {
   const canWriteInvoices = can(user, "invoices:write");
   const canDelete = can(user, "invoices:delete");
 
-  const docs = useQuery({ queryKey: ["documents"], queryFn: documentsApi.list });
-  const selected = useQuery({ queryKey: ["documents", selectedId], queryFn: () => documentsApi.get(selectedId!), enabled: selectedId !== null });
+  const docs = useQuery({
+    queryKey: ["documents"],
+    queryFn: documentsApi.list,
+    // Uploads and re-runs are processed in the background, so the list has to
+    // come back for the answer rather than waiting for the user to reload.
+    refetchInterval: (query) => (query.state.data?.some((d) => d.status === "pending") ? 2000 : false),
+  });
+  const selected = useQuery({
+    queryKey: ["documents", selectedId],
+    queryFn: () => documentsApi.get(selectedId!),
+    enabled: selectedId !== null,
+    refetchInterval: (query) => (query.state.data?.status === "pending" ? 2000 : false),
+  });
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["documents"] });
-  const retry = useMutation({ mutationFn: (id: number) => documentsApi.retry(id), onSuccess: invalidate });
+  const retry = useMutation({
+    mutationFn: ({ id, pipeline }: { id: number; pipeline?: PipelineName }) => documentsApi.retry(id, pipeline),
+    onSuccess: (document) => {
+      invalidate();
+      // The row is 'pending' again; seed it so the panel shows that immediately
+      // and its poll picks up the result.
+      queryClient.setQueryData(["documents", document.id], document);
+    },
+  });
+  // Whether the AI pipeline can run here decides whether to offer it on re-run.
+  const ocrStatus = useQuery({ queryKey: ["ocr", "status"], queryFn: ocrApi.status, staleTime: 60_000 });
+  const aiAvailable = ocrStatus.data?.pipelines.some((p) => p.name === "ai" && p.available) ?? false;
   const remove = useMutation({ mutationFn: (id: number) => documentsApi.remove(id), onSuccess: () => { invalidate(); select(null); } });
   const [downloadError, setDownloadError] = useState<unknown>(null);
 
@@ -128,6 +150,9 @@ export function DocumentsPage() {
   });
 
   const document_ = selected.data ?? null;
+  // Uploads stored before classification existed carry none; they read as unclassified.
+  const classification: DocumentClassification | null = document_?.extracted_fields?.classification ?? null;
+  const invoiceLike = classification?.invoice_like ?? true;
 
   useEffect(() => {
     setRows(document_?.extracted_fields?.line_items ?? null);
@@ -227,9 +252,14 @@ export function DocumentsPage() {
                     <td className="muted small">{displayDateTime(doc.created_at)}</td>
                     <td className="row" style={{ justifyContent: "flex-end", flexWrap: "nowrap" }}>
                       <button type="button" className="btn small" onClick={() => download(doc)}>Open file</button>
-                      <button type="button" className="btn small" onClick={() => retry.mutate(doc.id)} disabled={retry.isPending}>
-                        {retry.isPending && retry.variables === doc.id ? "Running…" : "Re-run OCR"}
+                      <button type="button" className="btn small" onClick={() => retry.mutate({ id: doc.id, pipeline: "rules" })} disabled={retry.isPending}>
+                        {retry.isPending && retry.variables?.id === doc.id && retry.variables.pipeline !== "ai" ? "Running…" : "Re-run OCR"}
                       </button>
+                      {aiAvailable && (
+                        <button type="button" className="btn small" title="Azure Vision + Azure OpenAI; the document is sent to Azure" onClick={() => retry.mutate({ id: doc.id, pipeline: "ai" })} disabled={retry.isPending}>
+                          {retry.isPending && retry.variables?.id === doc.id && retry.variables.pipeline === "ai" ? "Running…" : "Re-run with AI"}
+                        </button>
+                      )}
                       {canDelete && (
                         <ConfirmButton className="btn small danger" message={`Delete ${doc.filename}?`} onConfirm={() => remove.mutate(doc.id)}>Delete</ConfirmButton>
                       )}
@@ -265,6 +295,17 @@ export function DocumentsPage() {
               {selected.data!.status === "failed" && (
                 <InfoBanner tone="warn"><div><strong>OCR failed.</strong> {selected.data!.error} — the file is kept; use “Re-run OCR”.</div></InfoBanner>
               )}
+              {classification && <DocumentKindBanner classification={classification} />}
+              {(selected.data!.extracted_fields?.extraction_notes?.length ?? 0) > 0 && (
+                <InfoBanner tone={selected.data!.extracted_fields!.extraction_notes.some((n) => /failed|Dropped/.test(n)) ? "warn" : "info"}>
+                  <div>
+                    <strong>From the extraction pipeline.</strong>
+                    <ul style={{ margin: "0.25rem 0 0", paddingLeft: "1.1rem" }}>
+                      {selected.data!.extracted_fields!.extraction_notes.map((note) => <li key={note}>{note}</li>)}
+                    </ul>
+                  </div>
+                </InfoBanner>
+              )}
               <div className="grid two">
                 <KeyValue
                   items={[
@@ -279,6 +320,8 @@ export function DocumentsPage() {
                 {selected.data!.extracted_fields && (
                   <KeyValue
                     items={[
+                      ["Recognised as", classification ? `${classification.label} (${Math.round(classification.confidence * 100)}% sure)` : "not classified — re-run OCR"],
+                      ["Extracted by", selected.data!.extracted_fields.extraction_method === "ai" ? "AI (Azure OpenAI), grounded against the OCR text" : "Rule-based (labels, layout, table grid)"],
                       ["Invoice number", selected.data!.extracted_fields.invoice_numbers.join(", ") || "—"],
                       ["Dates", selected.data!.extracted_fields.dates.join(", ") || "—"],
                       ["GSTINs", selected.data!.extracted_fields.gstins.join(", ") || "—"],
@@ -412,8 +455,8 @@ export function DocumentsPage() {
                           ))}
                         </Select>
                       </Field>
-                      <button type="button" className="btn primary" onClick={() => createInvoice(selected.data!)}>
-                        Create invoice from this
+                      <button type="button" className={invoiceLike ? "btn primary" : "btn"} onClick={() => createInvoice(selected.data!)}>
+                        {createLabel(classification)}
                       </button>
                     </div>
                   )}
@@ -512,4 +555,65 @@ export function DocumentsPage() {
       )}
     </>
   );
+}
+
+/** What the create button offers depends on what the document is. */
+function createLabel(c: DocumentClassification | null): string {
+  if (!c) return "Create invoice from this";
+  if (!c.invoice_like) return "Create invoice anyway";
+  if (c.document_type === "CRN") return "Create credit note from this";
+  if (c.document_type === "DBN") return "Create debit note from this";
+  return "Create invoice from this";
+}
+
+const kindName = (kind: string) => kind.replace(/_/g, " ");
+
+/**
+ * The classifier's verdict, shown before anything else on the document.
+ *
+ * A confident tax invoice needs no banner — the fields below speak for
+ * themselves. Everything else does: a note goes down a different path, a
+ * purchase order or challan should not become an invoice at all, and a
+ * narrow call deserves a second look at the title.
+ */
+function DocumentKindBanner({ classification: c }: { classification: DocumentClassification }) {
+  const pct = Math.round(c.confidence * 100);
+  const why = c.evidence.length ? <div className="muted small" style={{ marginTop: "0.25rem" }}>Why: {c.evidence.join("; ")}.</div> : null;
+
+  if (!c.invoice_like) {
+    return (
+      <InfoBanner tone="warn">
+        <div>
+          <strong>This looks like a {c.label.toLowerCase()}, not a tax invoice</strong> ({pct}% sure).{" "}
+          {c.kind === "other"
+            ? "No document title or GST structure was recognised, so the values below may be anything."
+            : "It does not record a supply you made, so an invoice built from it would be wrong."}
+          {why}
+        </div>
+      </InfoBanner>
+    );
+  }
+  if (c.document_type && c.document_type !== "INV") {
+    return (
+      <InfoBanner tone="info">
+        <div>
+          <strong>Recognised as a {c.label.toLowerCase()}</strong> ({pct}% sure). It will be created as a {c.document_type}, which needs the
+          number and date of the invoice it refers to.
+          {why}
+        </div>
+      </InfoBanner>
+    );
+  }
+  if (c.runner_up || c.confidence < 0.7) {
+    return (
+      <InfoBanner tone="info">
+        <div>
+          <strong>Recognised as a {c.label.toLowerCase()}</strong>, but not confidently ({pct}%
+          {c.runner_up ? `; it could also be a ${kindName(c.runner_up)}` : ""}). Check the document title before creating anything.
+          {why}
+        </div>
+      </InfoBanner>
+    );
+  }
+  return null;
 }
