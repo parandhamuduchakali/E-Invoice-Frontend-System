@@ -259,6 +259,11 @@ export interface paths {
          *
          *     Returns the recovery codes **once**; they are stored only as hashes.
          *
+         *     Every session opened before this call is revoked, since none of them ever
+         *     met the second factor — people turn this on precisely when they suspect
+         *     someone else is in the account. The caller gets a replacement pair in the
+         *     response and the usual refresh cookie, so enrolment does not sign them out.
+         *
          *     Raises:
          *         401 Unauthorised: The code did not verify.
          *         422 Unprocessable Entity: No enrolment in progress, or already enabled.
@@ -577,11 +582,17 @@ export interface paths {
         put?: never;
         /**
          * Re-run OCR on a stored document
-         * @description Runs the OCR pipeline again on the stored file (e.g. after a failure or an engine change).
+         * @description Queue the stored file to be read again — after a failure, or with the other pipeline.
+         *
+         *     Answers ``202`` and processes in the background, exactly as the upload does.
+         *     Running it inside the request would hold a connection and a worker thread
+         *     for the whole parse, and in the deployment that matters the API is not the
+         *     machine with the OCR models on it. Poll ``GET /documents/{id}``.
          *
          *     Raises:
          *         404 Not Found: Unknown document or missing file.
-         *         4xx/503: The pipeline's own errors; the document is marked ``failed`` with the reason.
+         *         400 Bad Request: A pipeline this server cannot run.
+         *         409 Conflict: Already queued.
          */
         post: operations["retry_api_v1_documents__document_id__retry_post"];
         delete?: never;
@@ -1516,6 +1527,37 @@ export interface components {
             state_code: string;
         };
         /**
+         * DocumentClassificationResponse
+         * @description What kind of document the scan is, decided before the fields are read.
+         *
+         *     Attributes:
+         *         kind: The recognised kind.
+         *         label: Human-readable name for it.
+         *         confidence: 0-1, ordinal rather than calibrated — a clear title match
+         *             ranks above a body-cue guess, which is what a reviewer needs.
+         *         invoice_like: Whether an invoice record can be created from this. A
+         *             purchase order, proforma, challan or receipt is reviewed, not
+         *             imported.
+         *         document_type: ``INV`` / ``CRN`` / ``DBN`` when invoice-like, else null.
+         *         evidence: The cues that fired, most influential first (``title:``,
+         *             ``body:``, ``mentions:``, ``structure:``).
+         *         runner_up: The second-placed kind when the call was close.
+         */
+        DocumentClassificationResponse: {
+            /** Confidence */
+            confidence: number;
+            /** Document Type */
+            document_type: ("INV" | "CRN" | "DBN") | null;
+            /** Evidence */
+            evidence?: string[];
+            /** Invoice Like */
+            invoice_like: boolean;
+            kind: components["schemas"]["DocumentKind"];
+            /** Label */
+            label: string;
+            runner_up?: components["schemas"]["DocumentKind"] | null;
+        };
+        /**
          * DocumentDetailsResponse
          * @description The document's own identity and the transaction it describes.
          *
@@ -1568,6 +1610,12 @@ export interface components {
             /** Supply Type */
             supply_type?: string | null;
         };
+        /**
+         * DocumentKind
+         * @description The kinds an upload is sorted into.
+         * @enum {string}
+         */
+        DocumentKind: "tax_invoice" | "credit_note" | "debit_note" | "bill_of_supply" | "proforma_invoice" | "purchase_order" | "delivery_challan" | "receipt" | "eway_bill" | "other";
         /**
          * DocumentResponse
          * @description Full document including recognised text and extracted GST fields.
@@ -1715,43 +1763,58 @@ export interface components {
          *             plus per-field evidence and cross-field warnings. This is what the
          *             invoice form should be built from; the flat lists above remain for
          *             a reviewer scanning for anything the role assignment missed.
+         *         classification: What kind of document this is. Read it first: the
+         *             fields above are extracted from anything, and a purchase order
+         *             produces a perfectly plausible set of them.
+         *         extraction_method: ``rules`` or ``ai`` — which pipeline produced this.
+         *         extraction_notes: Messages for the reviewer from the pipeline: values
+         *             the model proposed that were not on the page, a fallback from AI
+         *             to rules, printed charges the form cannot hold.
          */
         ExtractedInvoiceFieldsResponse: {
             /** Amounts */
-            amounts: number[];
+            amounts?: number[];
+            classification?: components["schemas"]["DocumentClassificationResponse"];
             /** Currency */
-            currency: string | null;
+            currency?: string | null;
             /** Dates */
-            dates: string[];
+            dates?: string[];
+            /**
+             * Extraction Method
+             * @default rules
+             */
+            extraction_method?: string;
+            /** Extraction Notes */
+            extraction_notes?: string[];
             /** Gst Rates */
-            gst_rates: number[];
+            gst_rates?: number[];
             /** Gstins */
-            gstins: string[];
+            gstins?: string[];
             /** Hsn Codes */
-            hsn_codes: string[];
+            hsn_codes?: string[];
             /** Invalid Gstins */
-            invalid_gstins: string[];
+            invalid_gstins?: string[];
             /** Invoice Numbers */
-            invoice_numbers: string[];
+            invoice_numbers?: string[];
             /** Irn */
-            irn: string | null;
+            irn?: string | null;
             /** Key Values */
-            key_values: {
+            key_values?: {
                 [key: string]: string[];
             };
             /** Line Items */
             line_items?: components["schemas"]["ExtractedLineItemResponse"][];
             /** Place Of Supply */
-            place_of_supply: string | null;
+            place_of_supply?: string | null;
             /** Place Of Supply Code */
-            place_of_supply_code: string | null;
+            place_of_supply_code?: string | null;
             /** Reverse Charge */
-            reverse_charge: boolean | null;
+            reverse_charge?: boolean | null;
             /** State Codes */
-            state_codes: string[];
-            structured: components["schemas"]["StructuredInvoiceResponse"];
+            state_codes?: string[];
+            structured?: components["schemas"]["StructuredInvoiceResponse"];
             /** Total Amount */
-            total_amount: number | null;
+            total_amount?: number | null;
         };
         /**
          * ExtractedLineItemResponse
@@ -2462,10 +2525,27 @@ export interface components {
          *     Attributes:
          *         recovery_codes: One-time codes for when the device is lost. Stored only
          *             as hashes, so this is the only time they can be shown.
+         *         access_token: A replacement access token. Turning the second factor on
+         *             revokes every session opened before it — otherwise a session someone
+         *             else already had would keep working without ever meeting the new
+         *             factor — so the caller is handed a fresh pair rather than being
+         *             signed out in the middle of enrolment. The refresh half arrives as
+         *             the usual cookie. Clients must adopt this token.
+         *         token_type: Always ``bearer``.
+         *         expires_in: Access-token lifetime in seconds.
          */
         MfaEnabledResponse: {
+            /** Access Token */
+            access_token: string;
+            /** Expires In */
+            expires_in: number;
             /** Recovery Codes */
             recovery_codes: string[];
+            /**
+             * Token Type
+             * @default bearer
+             */
+            token_type?: string;
         };
         /**
          * MfaSetupResponse
@@ -2580,10 +2660,21 @@ export interface components {
         /**
          * OcrStatusResponse
          * @description Whether the OCR stack is installed and how it is configured.
+         *
+         *     Attributes:
+         *         available: The default OCR backend can run.
+         *         engine: Its OCR engine.
+         *         default_pipeline: Pipeline used when an upload names none.
+         *         pipelines: Both pipelines with availability, so a client can offer the choice.
          */
         OcrStatusResponse: {
             /** Available */
             available: boolean;
+            /**
+             * Default Pipeline
+             * @default rules
+             */
+            default_pipeline?: string;
             /** Dpi */
             dpi: number;
             /** Engine */
@@ -2594,6 +2685,8 @@ export interface components {
             max_file_mb: number;
             /** Max Pages */
             max_pages: number;
+            /** Pipelines */
+            pipelines?: components["schemas"]["PipelineInfoResponse"][];
             /** Profile */
             profile: string;
         };
@@ -2691,6 +2784,38 @@ export interface components {
             new_password: string;
         };
         /**
+         * PipelineInfoResponse
+         * @description One of the two extraction pipelines and whether this server can run it.
+         *
+         *     Attributes:
+         *         name: ``rules`` or ``ai`` — pass it as ``?pipeline=`` on upload or retry.
+         *         label: Short name for a chooser.
+         *         available: Whether it can run here right now.
+         *         reason: Why not, when it cannot.
+         *         ocr: The OCR backend it uses (``paddleocr``, ``llamaparse``, ``azure-vision``).
+         *         extractor: ``rules`` or ``azure-openai:<deployment>``.
+         *         data_leaves_server: The document or its text is sent to a third party.
+         *         description: One sentence for the chooser.
+         */
+        PipelineInfoResponse: {
+            /** Available */
+            available: boolean;
+            /** Data Leaves Server */
+            data_leaves_server: boolean;
+            /** Description */
+            description: string;
+            /** Extractor */
+            extractor: string;
+            /** Label */
+            label: string;
+            /** Name */
+            name: string;
+            /** Ocr */
+            ocr: string;
+            /** Reason */
+            reason: string;
+        };
+        /**
          * RefreshRequest
          * @description Optional payload for POST /api/v1/auth/refresh.
          *
@@ -2769,21 +2894,15 @@ export interface components {
          *         evidence: One entry per field that was filled.
          */
         StructuredInvoiceResponse: {
-            dispatch: components["schemas"]["PartyDetailsResponse"];
-            document: components["schemas"]["DocumentDetailsResponse"];
-            /**
-             * Evidence
-             * @default []
-             */
+            dispatch?: components["schemas"]["PartyDetailsResponse"];
+            document?: components["schemas"]["DocumentDetailsResponse"];
+            /** Evidence */
             evidence?: components["schemas"]["FieldEvidenceResponse"][];
-            recipient: components["schemas"]["PartyDetailsResponse"];
-            shipping: components["schemas"]["PartyDetailsResponse"];
-            supplier: components["schemas"]["PartyDetailsResponse"];
-            totals: components["schemas"]["TaxTotalsResponse"];
-            /**
-             * Warnings
-             * @default []
-             */
+            recipient?: components["schemas"]["PartyDetailsResponse"];
+            shipping?: components["schemas"]["PartyDetailsResponse"];
+            supplier?: components["schemas"]["PartyDetailsResponse"];
+            totals?: components["schemas"]["TaxTotalsResponse"];
+            /** Warnings */
             warnings?: string[];
         };
         /**
@@ -3295,7 +3414,11 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RefreshRequest"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             204: {
@@ -3303,6 +3426,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };
@@ -3760,6 +3892,8 @@ export interface operations {
                 use_text_layer?: boolean;
                 /** @description PDF render DPI */
                 dpi?: number | null;
+                /** @description Extraction pipeline: rules (OCR + rule-based) or ai (Azure Vision + Azure OpenAI). Default from EXTRACTION_PIPELINE; GET /ocr/status lists availability. */
+                pipeline?: ("rules" | "ai") | null;
             };
             header?: {
                 "X-Workspace-Id"?: number | null;
@@ -3892,7 +4026,10 @@ export interface operations {
     };
     retry_api_v1_documents__document_id__retry_post: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Extraction pipeline: rules or ai. Default from EXTRACTION_PIPELINE. */
+                pipeline?: ("rules" | "ai") | null;
+            };
             header?: {
                 "X-Workspace-Id"?: number | null;
             };
@@ -3904,12 +4041,12 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Successful Response */
-            200: {
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["OcrDocumentResponse"];
+                    "application/json": components["schemas"]["DocumentResponse"];
                 };
             };
             /** @description Validation Error */
@@ -4534,6 +4671,8 @@ export interface operations {
                 use_text_layer?: boolean;
                 /** @description PDF render DPI */
                 dpi?: number | null;
+                /** @description Extraction pipeline: rules or ai. */
+                pipeline?: ("rules" | "ai") | null;
             };
             header?: {
                 "X-Workspace-Id"?: number | null;

@@ -168,11 +168,18 @@ function expireSession(): void {
   if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("auth:expired"));
 }
 
+// A 401 from these means "those credentials are wrong", not "your session
+// expired". Refreshing would be pointless — during sign-in there is no session
+// yet — and the failed refresh would fire auth:expired, logging the user out of
+// a session they are in the middle of establishing.
 const NO_REFRESH_PATHS = [
   "/api/v1/auth/login",
   "/api/v1/auth/refresh",
   "/api/v1/auth/logout",
   "/api/v1/auth/register",
+  "/api/v1/auth/mfa/verify",
+  "/api/v1/auth/forgot-password",
+  "/api/v1/auth/reset-password",
 ];
 
 // ── Core request ───────────────────────────────────────────────────────────

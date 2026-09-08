@@ -6,6 +6,7 @@
 
 import type { ExtractedInvoiceFields, InvoiceCreateRequest, LineItemInput, User } from "@/api/types";
 import { addDaysIso, todayIso } from "./format";
+import { toGstRate, toUqc } from "./gst";
 import { round2 } from "./invoiceMath";
 
 export interface OcrInvoiceDraft {
@@ -18,6 +19,48 @@ export interface OcrInvoiceDraft {
   sourceInvoiceNumber: string | null;
 }
 
+/**
+ * The rate for the invoice as a whole, and how it was arrived at.
+ *
+ * Preference order: the printed totals, which state the tax and the value it
+ * was charged on; then the item rates, doubling a half where the document
+ * clearly split CGST and SGST; then nothing. Only real GST slabs are returned —
+ * a number that is not one is reported for the user to set by hand rather than
+ * put into the form, where it would be shown as something else entirely.
+ */
+function documentGstRate(fields: ExtractedInvoiceFields): { value: number | null; note: string } {
+  const totals = fields.structured?.totals;
+  const base = totals?.assessable_value ?? null;
+  if (base && base > 0) {
+    const tax = (totals?.igst_value ?? 0) + (totals?.cgst_value ?? 0) + (totals?.sgst_value ?? 0);
+    if (tax > 0) {
+      const snapped = toGstRate(round2((tax / base) * 100));
+      if (snapped !== null) {
+        return { value: snapped, note: `GST rate ${snapped}% derived from the printed tax and taxable value.` };
+      }
+    }
+  }
+
+  const rates = (fields.gst_rates ?? []).filter((r) => r > 0);
+  if (!rates.length) return { value: null, note: "" };
+  const highest = Math.max(...rates);
+
+  // Two equal halves, or a half that is not itself a slab while twice it is:
+  // both mean the document printed CGST and SGST separately.
+  const splitPrinted = (totals?.cgst_value ?? 0) > 0 && (totals?.sgst_value ?? 0) > 0;
+  const doubled = toGstRate(round2(highest * 2));
+  if ((splitPrinted || toGstRate(highest) === null) && doubled !== null) {
+    return {
+      value: doubled,
+      note: `GST rate ${doubled}% (the document prints it as two halves of ${highest}%).`,
+    };
+  }
+
+  const snapped = toGstRate(highest);
+  if (snapped !== null) return { value: snapped, note: `GST rate ${snapped}% detected.` };
+  return { value: null, note: "" };
+}
+
 export function ocrToInvoiceDraft(fields: ExtractedInvoiceFields, seller: User | null, documentId: number | null = null): OcrInvoiceDraft {
   const notes: string[] = [];
   const invoice: Partial<InvoiceCreateRequest> = {};
@@ -26,6 +69,30 @@ export function ocrToInvoiceDraft(fields: ExtractedInvoiceFields, seller: User |
     // Links the invoice to the stored upload so the scan can be traced later.
     invoice.document_id = documentId;
     notes.push(`Linked to stored document #${documentId}.`);
+  }
+
+  // What the document *is* decides what to make of it. Credit and debit notes
+  // go down the CRN/DBN path, which needs the invoice they refer to; anything
+  // that is not an invoice at all still gets a draft — the fields were read —
+  // but the first note says so, and the Documents page will have warned.
+  const kind = fields.classification;
+  if (kind && kind.document_type && kind.document_type !== "INV") {
+    invoice.document_type = kind.document_type;
+    const preceding = fields.structured.document.preceding_invoice_number;
+    const precedingDate = fields.structured.document.preceding_invoice_date;
+    if (preceding) invoice.preceding_invoice_number = preceding;
+    if (precedingDate) invoice.preceding_invoice_date = precedingDate;
+    notes.push(
+      `Recognised as a ${kind.label.toLowerCase()} (${kind.document_type}). ` +
+        (preceding
+          ? `It refers to invoice ${preceding}${precedingDate ? ` of ${precedingDate}` : ""}.`
+          : "Enter the invoice it refers to — a note cannot be filed without it."),
+    );
+  } else if (kind && !kind.invoice_like) {
+    notes.unshift(
+      `This was recognised as a ${kind.label.toLowerCase()}, not a tax invoice. ` +
+        "The values below were still read from it, but they do not describe a supply you made — do not save this unless you are sure.",
+    );
   }
 
   // Dates: first date is usually the issue date; due date defaults to +30 days.
@@ -48,11 +115,13 @@ export function ocrToInvoiceDraft(fields: ExtractedInvoiceFields, seller: User |
     invoice.reverse_charge = fields.reverse_charge;
   }
 
-  // Default GST rate: the highest non-zero rate seen (item rates override per line).
-  const rates = fields.gst_rates.filter((r) => r > 0);
-  if (rates.length) {
-    invoice.tax_rate = Math.max(...rates);
-    notes.push(`GST rate ${invoice.tax_rate}% detected.`);
+  // Default GST rate. An intra-state invoice prints the tax as two halves —
+  // "CGST 9% / SGST 9%" — and the invoice's rate is their sum, not the larger
+  // half. Taking the maximum would file every such invoice at half the tax.
+  const rate = documentGstRate(fields);
+  if (rate.value !== null) {
+    invoice.tax_rate = rate.value;
+    notes.push(rate.note);
   }
 
   // Line items, best source first.
@@ -67,12 +136,12 @@ export function ocrToInvoiceDraft(fields: ExtractedInvoiceFields, seller: User |
       description: row.description || `Item ${index + 1}`,
       hsn_code: row.hsn_code,
       is_service: row.hsn_code ? row.hsn_code.startsWith("99") : false,
-      unit: row.unit,
+      unit: toUqc(row.unit),
       quantity: row.quantity ?? 1,
       // Some invoices print only a row total; derive the rate from it.
       unit_price: row.unit_price ?? (row.amount !== null && row.quantity ? row.amount / row.quantity : (row.amount ?? 0)),
       discount: row.discount ?? 0,
-      gst_rate: row.gst_rate,
+      gst_rate: toGstRate(row.gst_rate),
     }));
     notes.push(`${fields.line_items.length} line item(s) read from the document's item table. Check the quantities and rates.`);
 

@@ -1,17 +1,43 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type DragEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { documentsApi, ocrApi } from "@/api/endpoints";
-import type { OcrDocument, OcrExtractOptions } from "@/api/types";
+import type { OcrDocument, OcrExtractOptions, PipelineInfo, StoredDocument } from "@/api/types";
 import { useAuth } from "@/auth/AuthContext";
-import { Card, Checkbox, ErrorBanner, Field, InfoBanner, Input, KeyValue, PageHeader, Spinner } from "@/components/ui";
+import { Card, Checkbox, ErrorBanner, errorMessage, Field, InfoBanner, Input, KeyValue, PageHeader, Spinner } from "@/components/ui";
 import { money } from "@/lib/format";
 import { ocrToInvoiceDraft } from "@/lib/ocrToInvoice";
 
 const ACCEPT = ".pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp,application/pdf,image/*";
 
+/**
+ * A stored document as the synchronous endpoint would have returned it.
+ *
+ * The page renders one shape whether the result arrived from the upload itself
+ * (a duplicate, already processed) or from polling; keeping the mapping in one
+ * place is what makes those two paths agree.
+ */
+function toOcrDocument(document: StoredDocument, duplicate: boolean): OcrDocument | null {
+  if (document.status !== "processed" || !document.extracted_fields) return null;
+  return {
+    document_id: document.id,
+    duplicate,
+    filename: document.filename,
+    source_type: document.content_type === "application/pdf" ? "pdf" : "image",
+    engine: document.engine ?? "",
+    page_count: document.page_count,
+    pages: [],
+    full_text: document.full_text ?? "",
+    extracted_fields: document.extracted_fields,
+  } as OcrDocument;
+}
+
 export function OcrPage() {
-  const { user } = useAuth();
+  // `seller` is the workspace profile; `user` is whoever is signed in. The
+  // draft mapper uses it to tell the seller's own GSTIN from the buyer's, and
+  // a member account carries no GSTIN of its own — so passing `user` here made
+  // the workspace's own GSTIN look like a buyer candidate.
+  const { user, seller } = useAuth();
   const navigate = useNavigate();
   const fileInput = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
@@ -27,19 +53,33 @@ export function OcrPage() {
   // the connection open for the whole parse (~40s for a single page), which
   // browsers and proxies time out.
   const [jobId, setJobId] = useState<number | null>(null);
+  const [duplicate, setDuplicate] = useState(false);
+  const queryClient = useQueryClient();
 
   const job = useQuery({
     queryKey: ["documents", jobId],
     queryFn: () => documentsApi.get(jobId!),
     enabled: jobId !== null,
-    refetchInterval: (query) => (query.state.data?.status === "pending" ? 2000 : false),
+    refetchInterval: (query) => {
+      // A failed poll leaves `data` undefined. Stopping there would look exactly
+      // like a finished job: no spinner, no result, no message. Keep asking, a
+      // little more slowly, until the document answers or the user leaves.
+      if (query.state.error) return 5000;
+      return query.state.data?.status === "pending" ? 2000 : false;
+    },
   });
 
   const extract = useMutation({
     mutationFn: (f: File) => documentsApi.upload(f, options),
     onSuccess: (document) => {
-      setResult(null);
+      setDuplicate(document.duplicate);
+      // Re-uploading bytes we already scanned returns that record, processed,
+      // with the same id. Waiting for the poll to notice would mean waiting for
+      // a change that never comes, so a finished document is shown at once and
+      // only a pending one is handed to the poller.
+      queryClient.setQueryData(["documents", document.id], document);
       setJobId(document.id);
+      setResult(toOcrDocument(document, document.duplicate));
     },
   });
 
@@ -47,24 +87,11 @@ export function OcrPage() {
   useEffect(() => {
     const document = job.data;
     if (!document || document.status === "pending") return;
-    setResult(
-      document.status === "processed" && document.extracted_fields
-        ? ({
-            document_id: document.id,
-            duplicate: false,
-            filename: document.filename,
-            source_type: document.content_type === "application/pdf" ? "pdf" : "image",
-            engine: document.engine ?? "",
-            page_count: document.page_count,
-            pages: [],
-            full_text: document.full_text ?? "",
-            extracted_fields: document.extracted_fields,
-          } as OcrDocument)
-        : null,
-    );
-  }, [job.data]);
+    setResult(toOcrDocument(document, duplicate));
+  }, [job.data, duplicate]);
 
-  const working = extract.isPending || job.data?.status === "pending" || (jobId !== null && job.isPending);
+  const working =
+    extract.isPending || job.data?.status === "pending" || (jobId !== null && job.isPending && !job.error);
   const failed = job.data?.status === "failed" ? job.data.error : null;
 
   function pick(files: FileList | null) {
@@ -80,12 +107,20 @@ export function OcrPage() {
   }
 
   const fields = result?.extracted_fields;
-  const draft = fields ? ocrToInvoiceDraft(fields, user, result?.document_id ?? null) : null;
+  const pipelines: PipelineInfo[] = status.data?.pipelines ?? [];
+  const pipelineName = options.pipeline ?? status.data?.default_pipeline ?? "rules";
+  const pipeline = pipelines.find((p) => p.name === pipelineName) ?? null;
+  // OpenCV clean-up only applies when a page is rasterised here; Azure Vision reads the file as-is.
+  const localOcr = pipeline ? pipeline.ocr !== "azure-vision" && pipeline.ocr !== "llamaparse" : true;
+  const draft = fields ? ocrToInvoiceDraft(fields, seller ?? user, result?.document_id ?? null) : null;
   const tooBig = file && status.data && file.size > status.data.max_file_mb * 1024 * 1024;
 
   return (
     <>
-      <PageHeader title="Scan an invoice" subtitle="PDF → images (OpenCV) → text (PaddleOCR). Recognised GST fields can pre-fill a new invoice." />
+      <PageHeader
+        title="Scan an invoice"
+        subtitle="Two ways to read a document: rule-based (OCR on this server, label vocabularies and the table grid) or AI (Azure Vision + Azure OpenAI). Either way the fields are checked and can pre-fill a new invoice."
+      />
 
       {status.data && !status.data.available && (
         <InfoBanner tone="warn">The OCR engine is not installed on the server. Run <code>pip install -r requirements.txt</code> on the backend to enable this page.</InfoBanner>
@@ -118,6 +153,31 @@ export function OcrPage() {
           </div>
           {tooBig && <InfoBanner tone="warn">This file exceeds the server limit of {status.data!.max_file_mb} MB.</InfoBanner>}
 
+          {pipelines.length > 0 && (
+            <fieldset style={{ marginTop: "1rem" }}>
+              <legend>Extraction method</legend>
+              <div className="grid two" style={{ gap: "0.75rem" }}>
+                {pipelines.map((p) => (
+                  <label
+                    key={p.name}
+                    className="card"
+                    style={{ padding: "0.75rem", cursor: p.available ? "pointer" : "not-allowed", opacity: p.available ? 1 : 0.6, outline: pipelineName === p.name ? "2px solid var(--accent, #2563eb)" : "none" }}
+                  >
+                    <div className="row" style={{ alignItems: "center" }}>
+                      <input type="radio" name="pipeline" value={p.name} checked={pipelineName === p.name} disabled={!p.available} onChange={() => setOptions({ ...options, pipeline: p.name })} />
+                      <strong>{p.label}</strong>
+                      <span className="pill">{p.ocr} → {p.extractor}</span>
+                    </div>
+                    <div className="muted small" style={{ marginTop: "0.35rem" }}>{p.description}</div>
+                    {p.data_leaves_server && <div className="small" style={{ marginTop: "0.35rem", color: "var(--warn-fg, #92400e)" }}>The document is sent to a third-party service.</div>}
+                    {!p.available && <div className="small" style={{ marginTop: "0.35rem" }}>Not available: {p.reason}</div>}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          )}
+
+          {localOcr && (
           <fieldset style={{ marginTop: "1rem" }}>
             <legend>OpenCV clean-up</legend>
             <div className="row">
@@ -136,20 +196,40 @@ export function OcrPage() {
               Defaults were tuned on a real GST invoice: denoise off (it smears small table text), deskew on, small images upscaled automatically.
             </p>
           </fieldset>
+          )}
 
           <div className="row">
-            <button type="button" className="btn primary" disabled={!file || working || Boolean(tooBig) || status.data?.available === false} onClick={() => file && extract.mutate(file)}>
-              {working ? "Recognising… (about a minute per page on CPU)" : "Extract text"}
+            <button
+              type="button"
+              className="btn primary"
+              disabled={!file || working || Boolean(tooBig) || (pipeline ? !pipeline.available : status.data?.available === false)}
+              onClick={() => file && extract.mutate(file)}
+            >
+              {working
+                ? pipelineName === "ai" ? "Reading with Azure…" : "Recognising… (about a minute per page on CPU)"
+                : pipelineName === "ai" ? "Extract with AI" : "Extract fields"}
             </button>
             {file && <button type="button" className="btn" onClick={() => pick(null)}>Clear</button>}
-            {status.data && <span className="muted small">Engine: {status.data.engine} · {status.data.profile} · {status.data.lang}</span>}
+            {status.data && (
+              <span className="muted small">
+                {pipeline ? `${pipeline.ocr} → ${pipeline.extractor}` : `Engine: ${status.data.engine} · ${status.data.profile} · ${status.data.lang}`}
+              </span>
+            )}
           </div>
           <ErrorBanner error={extract.error} onDismiss={() => extract.reset()} />
+          {job.error && (
+            <InfoBanner tone="warn">
+              Could not read the job’s progress: {errorMessage(job.error)} Still trying — the document is
+              safe either way and can be opened from the Documents page.
+            </InfoBanner>
+          )}
           {failed && <InfoBanner tone="warn">OCR failed: {failed} You can retry it from the Documents page.</InfoBanner>}
           {result?.document_id && (
             <InfoBanner tone={result.duplicate ? "warn" : "success"}>
               <div>
-                {result.duplicate ? "This exact file was uploaded before — the stored copy was reused and re-processed. " : "Stored as "}
+                {result.duplicate
+                  ? "This exact file was uploaded before, so the stored copy was reused rather than scanned again. Re-run it from the Documents page if you want a fresh read. "
+                  : "Stored as "}
                 <Link to={`/documents?id=${result.document_id}`}>document #{result.document_id}</Link>; it can be reviewed or re-run from the Documents page.
               </div>
             </InfoBanner>
@@ -163,8 +243,16 @@ export function OcrPage() {
             <p className="muted">Upload a document to see invoice number, dates, GSTINs, HSN codes, totals and place of supply.</p>
           ) : (
             <>
+              {(fields.extraction_notes?.length ?? 0) > 0 && (
+                <InfoBanner tone={fields.extraction_notes.some((n) => /failed|Dropped/.test(n)) ? "warn" : "info"}>
+                  <ul style={{ margin: 0, paddingLeft: "1.1rem" }}>
+                    {fields.extraction_notes.map((note) => <li key={note}>{note}</li>)}
+                  </ul>
+                </InfoBanner>
+              )}
               <KeyValue
                 items={[
+                  ["Extracted by", fields.extraction_method === "ai" ? "AI (Azure OpenAI), grounded against the OCR text" : "Rule-based (labels, layout, table grid)"],
                   ["Invoice number", fields.invoice_numbers.join(", ") || "—"],
                   ["Dates", fields.dates.join(", ") || "—"],
                   ["GSTINs (valid)", fields.gstins.length ? fields.gstins.map((g) => <code key={g} style={{ marginRight: 6 }}>{g}</code>) : "—"],

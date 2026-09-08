@@ -114,10 +114,19 @@ Two consequences worth knowing:
 The only thing this app persists is `einvoice.workspace`, the workspace id an admin has switched to — a
 preference, not a credential.
 
+**Rates and units from a scan are snapped before they reach the form.** A document printing "CGST 9% / SGST 9%"
+carries an 18% invoice; reading the larger half as the rate files it at half the tax. `documentGstRate` prefers
+the printed totals, then treats a rate that is not a GST slab (but whose double is) as a half. Units and rates
+outside the form's own lists are coerced by `toUqc`/`toGstRate` — a `<select>` given a value it has no option for
+displays the first one while the form submits the original, which is the quietest possible way to file a wrong
+invoice.
+
 **Second factor.** `login()` in `AuthContext` resolves to `null` once a session exists, or to an `MfaChallenge`
 when the account has TOTP enabled; the login page then asks for the code and calls `completeMfa`. Enrolment lives
 on **Profile** (`MfaCard`): the otpauth URL is rendered as a QR with `src/components/QrCode.tsx`, the first code
-confirms it, and the eight recovery codes are shown exactly once.
+confirms it, and the eight recovery codes are shown exactly once. Enabling it revokes every session opened before the second
+factor existed, so the response carries a replacement access token that `MfaCard` adopts — without that, the
+next request after enrolment would 401.
 
 ---
 
@@ -183,8 +192,8 @@ split on the invoice form matches what the backend computes.
 | `/invoices` | Paginated list, status filter, number search, IRN badge | `GET /invoices/` |
 | `/invoices/new`, `/invoices/:id/edit` | Full GST form: document type, supply type, reverse charge, IGST-on-intra, place of supply, preceding document for notes, ship-to / dispatch-from, line items with HSN/SAC, unit, discount and rate; **live totals with the tax split** | `POST /invoices/`, `PATCH /invoices/:id` |
 | `/invoices/:id` | Detail (the IRP's **signed QR rendered as an image** on the printable invoice, as the GST rules require; download of the **filed INV-01** frozen at registration), status change (dropdown offers only the backend's `allowed_status_transitions`), link to the scanned source document, delete; **e-invoice panel**: readiness checklist with fix links, INV-01 JSON (copy / download), record IRN + ack + signed QR; locked after IRN | `/einvoice/readiness`, `/einvoice`, `/irn` |
-| `/ocr` | Drag-and-drop PDF / image, OpenCV options, extracted GST fields, and the **item table rebuilt from the page layout** (description, HSN, qty, rate, GST %, amount) with a warning on any row whose arithmetic does not reconcile. **Create invoice from this** pre-fills the form from those rows, incl. `document_id` and `source_reference`, and pre-selects a client by GSTIN. The upload returns immediately and the page polls the document until it is `processed` or `failed` — see [Long-running OCR](#long-running-ocr) | `GET /ocr/status`, `POST /documents/`, `GET /documents/:id` |
-| `/documents` | Every stored upload with status (processed / failed), engine, pages and the invoice it produced; open the file, re-run OCR, create an invoice from a processed scan, delete (blocked while linked) | `/documents` CRUD, `POST /documents/:id/retry`, `GET /documents/:id/file` |
+| `/ocr` | Drag-and-drop PDF / image, OpenCV options, extracted GST fields, and the **item table rebuilt from the page layout** (description, HSN, qty, rate, GST %, amount) with a warning on any row whose arithmetic does not reconcile. **Create invoice from this** pre-fills the form from those rows, incl. `document_id` and `source_reference`, and pre-selects a client by GSTIN. The upload returns immediately and the page polls the document until it is `processed` or `failed` — see [Long-running OCR](#long-running-ocr); **choose the extraction method** per upload — rule-based (OCR on the server, nothing leaves it) or AI (Azure Vision + Azure OpenAI, marked as sending the document to a third party, offered only when the server has it configured); the result says which pipeline produced it and lists the pipeline's notes (dropped model values, an AI→rules fallback) | `GET /ocr/status`, `POST /documents/`, `GET /documents/:id` |
+| `/documents` | Every stored upload with status (processed / failed), engine, pages and the invoice it produced; **what the document is** (tax invoice, credit note, purchase order, challan, …) with the cues that decided it — a non-invoice gets a warning and a demoted "Create invoice anyway", a note goes down the CRN/DBN path; open the file, re-run OCR (rule-based, or **with AI** when the server offers it) — queued in the background, so the list and the open document poll until it lands; correct the item table, create an invoice from a processed scan, delete (blocked while linked) | `/documents` CRUD, `POST /documents/:id/retry`, `GET /documents/:id/file` |
 | `/audit` | Append-only audit trail (managers and admins): who changed what and when, filterable by action, record type and date, each row expandable to the before/after values, plus a CSV export of the current filter. Admins can widen the scope to every workspace | `GET /audit/`, `GET /audit/actions`, `GET /audit/export.csv` |
 
 ---
